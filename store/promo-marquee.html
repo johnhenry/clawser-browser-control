@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 1400px; height: 560px;
+    background: linear-gradient(135deg, #0a1628 0%, #132744 35%, #1a3a5c 70%, #0f2035 100%);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    color: #e8f0f8;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    position: relative;
+  }
+  .bg-glow {
+    position: absolute;
+    width: 700px; height: 700px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(137,190,213,0.13) 0%, transparent 70%);
+    top: -200px; right: -50px;
+  }
+  .bg-glow-2 {
+    position: absolute;
+    width: 500px; height: 500px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(137,190,213,0.08) 0%, transparent 70%);
+    bottom: -150px; left: -100px;
+  }
+  .bg-glow-3 {
+    position: absolute;
+    width: 300px; height: 300px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(137,190,213,0.06) 0%, transparent 70%);
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+  }
+  .container {
+    display: flex;
+    align-items: center;
+    gap: 90px;
+    z-index: 1;
+    padding: 0 100px;
+    width: 100%;
+  }
+  .left {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }
+  .logo-row {
+    display: flex;
+    align-items: center;
+    gap: 22px;
+  }
+  .logo-row img {
+    width: 80px; height: 80px;
+    border-radius: 18px;
+    background: #fff;
+    padding: 8px;
+  }
+  .logo-text {
+    font-size: 52px;
+    font-weight: 700;
+    letter-spacing: -1.5px;
+    color: #fff;
+  }
+  .tagline {
+    font-size: 24px;
+    color: #89bed5;
+    font-weight: 500;
+    line-height: 1.5;
+    max-width: 520px;
+  }
+  .features {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+  }
+  .pill {
+    background: rgba(137,190,213,0.1);
+    border: 1px solid rgba(137,190,213,0.22);
+    border-radius: 24px;
+    padding: 8px 18px;
+    font-size: 14px;
+    color: #a8cfe0;
+    letter-spacing: 0.3px;
+  }
+  .right {
+    flex: 0 0 500px;
+  }
+  .terminal {
+    background: #0d1b2a;
+    border: 1px solid rgba(137,190,213,0.3);
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.5), 0 0 48px rgba(137,190,213,0.06);
+  }
+  .terminal-bar {
+    background: rgba(137,190,213,0.07);
+    padding: 13px 18px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid rgba(137,190,213,0.12);
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .dot-r { background: #ff5f56; }
+  .dot-y { background: #ffbd2e; }
+  .dot-g { background: #27c93f; }
+  .terminal-title {
+    flex: 1;
+    text-align: center;
+    font-size: 13px;
+    color: #5a8a9f;
+    margin-right: 36px;
+  }
+  .terminal-body {
+    padding: 22px 24px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 14px;
+    line-height: 1.75;
+  }
+  .prompt { color: #89bed5; }
+  .cmd { color: #e8f0f8; }
+  .output { color: #5a8a9f; }
+  .success { color: #27c93f; }
+  .tool { color: #ffbd2e; }
+  .line { margin-bottom: 3px; }
+</style>
+</head>
+<body>
+  <div class="bg-glow"></div>
+  <div class="bg-glow-2"></div>
+  <div class="bg-glow-3"></div>
+  <div class="container">
+    <div class="left">
+      <div class="logo-row">
+        <img src="/icon-128.png" alt="Clawser">
+        <span class="logo-text">Clawser</span>
+      </div>
+      <div class="tagline">
+        Give your AI agent real browser superpowers — tabs, DOM, screenshots, input, and more.
+      </div>
+      <div class="features">
+        <span class="pill">Tab Control</span>
+        <span class="pill">Screenshots</span>
+        <span class="pill">DOM Access</span>
+        <span class="pill">Input Simulation</span>
+        <span class="pill">Network Monitor</span>
+        <span class="pill">Cookie Relay</span>
+      </div>
+    </div>
+    <div class="right">
+      <div class="terminal">
+        <div class="terminal-bar">
+          <div class="dot dot-r"></div>
+          <div class="dot dot-y"></div>
+          <div class="dot dot-g"></div>
+          <div class="terminal-title">clawser agent</div>
+        </div>
+        <div class="terminal-body">
+          <div class="line"><span class="prompt">&gt;</span> <span class="cmd">open docs.example.com</span></div>
+          <div class="line"><span class="tool">[tab]</span> <span class="output">opened tab #3</span></div>
+          <div class="line"><span class="prompt">&gt;</span> <span class="cmd">screenshot</span></div>
+          <div class="line"><span class="tool">[capture]</span> <span class="output">1280x800 saved</span></div>
+          <div class="line"><span class="prompt">&gt;</span> <span class="cmd">click "Sign In"</span></div>
+          <div class="line"><span class="tool">[dom]</span> <span class="output">clicked button#login</span></div>
+          <div class="line"><span class="prompt">&gt;</span> <span class="cmd">type email "me@dev.io"</span></div>
+          <div class="line"><span class="tool">[input]</span> <span class="success">typed into input#email</span></div>
+          <div class="line"><span class="prompt">&gt;</span> <span class="cmd">monitor network</span></div>
+          <div class="line"><span class="tool">[net]</span> <span class="success">watching 12 requests...</span></div>
+          <div class="line" style="margin-top:6px"><span class="prompt">&gt;</span> <span class="cmd" style="opacity:0.4">_</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

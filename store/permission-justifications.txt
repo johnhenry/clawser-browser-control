@@ -1,0 +1,72 @@
+CHROME WEB STORE — PERMISSION JUSTIFICATIONS
+==============================================
+Copy-paste these into the Developer Console permission fields.
+
+tabs
+----
+Required to open, close, navigate, query, and manage browser tabs on behalf of the Clawser AI agent. The agent needs tab control to automate browser workflows directed by the user.
+
+activeTab
+---------
+Required to access the currently active tab when the user invokes the agent. This limits access to only the tab the user is actively working with.
+
+scripting
+---------
+Required to inject content scripts into web pages so the agent can read page content (DOM), extract text, and interact with page elements as directed by the user.
+
+userScripts
+-----------
+Required to execute user-defined scripts in the page context for advanced automation scenarios. Scripts are provided by the local Clawser workspace, not from external sources.
+
+webRequest
+----------
+Required to monitor network requests on pages the agent is interacting with. This enables debugging, performance monitoring, and API response inspection as directed by the user.
+
+cookies
+-------
+Required to read cookie data for authentication relay when the agent needs to interact with authenticated pages on the user's behalf. Cookies are only read locally and never transmitted externally.
+
+storage
+-------
+Required to persist extension configuration settings (e.g., connection preferences) locally using chrome.storage.local. No personal data is stored.
+
+alarms
+------
+Required to schedule periodic background tasks such as heartbeat checks to maintain the connection between the extension and the local Clawser workspace.
+
+debugger (optional)
+-------------------
+Optionally requested when the user enables advanced browser inspection features. Provides Chrome DevTools Protocol access for detailed page debugging. Only activated with explicit user consent.
+
+Host permissions: <all_urls>
+----------------------------
+Required because the Clawser agent needs to operate on any web page the user directs it to. The extension is a general-purpose browser automation tool — the user controls which sites the agent visits. The extension only activates when commanded by the local Clawser workspace.
+
+
+SINGLE PURPOSE DESCRIPTION
+===========================
+This extension enables the Clawser AI agent workspace (running locally) to control the browser — managing tabs, capturing screenshots, reading and interacting with web page content, simulating user input, and monitoring network activity. It acts as a bridge between the local agent and the browser, operating only when directed by the user through the Clawser workspace.
+
+
+STORE DESCRIPTION (detailed)
+==============================
+Clawser Browser Control is the companion extension for the Clawser browser agent workspace — a browser-native AI agent runtime that runs entirely on your machine.
+
+This extension bridges your local Clawser workspace with full browser capabilities:
+
+• Tab Management — Open, close, navigate, and switch between tabs programmatically
+• Screenshots — Capture full-page or viewport screenshots for agent analysis
+• DOM Access — Read, query, and interact with live page elements
+• Input Simulation — Click buttons, fill forms, type text, and scroll pages
+• Network Monitoring — Observe requests and responses for debugging
+• Cookie Access — Relay authentication state for working with logged-in sites
+
+How it works:
+1. Run the Clawser workspace locally (localhost)
+2. Install this extension
+3. The agent communicates with the extension via local messaging
+4. You stay in control — the agent only acts when you direct it
+
+Privacy first: All data stays on your machine. No external servers, no tracking, no telemetry. The extension communicates only with your local Clawser workspace.
+
+Requires Chrome 135 or later.
