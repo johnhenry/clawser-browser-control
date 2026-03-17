@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Clawser Browser Control",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Gives the Clawser agent real browser control: tabs, screenshots, DOM, input, monitoring.",
   "minimum_chrome_version": "135",
 
