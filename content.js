@@ -89,7 +89,21 @@ function withTimeout(promise, ms) {
 window.addEventListener('message', async (ev) => {
   if (ev.source !== window) return;
   const msg = ev.data;
-  if (!msg || msg.type !== MARKER || msg.direction !== 'request') return;
+  if (!msg || msg.type !== MARKER) return;
+
+  // Fire-and-forget notifications from the page (e.g. "this workspace is
+  // ready" or "here's the result of a routine you asked me to run") — no
+  // response expected, so no id correlation needed.
+  if (msg.direction === 'notify') {
+    try {
+      chrome.runtime.sendMessage(msg);
+    } catch {
+      // Runtime likely invalidated — nothing to relay to.
+    }
+    return;
+  }
+
+  if (msg.direction !== 'request') return;
   if (msg.id === undefined || msg.id === null) {
     console.warn('[clawser-ext] Ignoring request with no id — the page won\'t be able to correlate a response:', msg.action);
     return;
@@ -122,6 +136,15 @@ window.addEventListener('message', async (ev) => {
       error: err.message || 'Extension communication error',
     }, '*');
   }
+});
+
+// ── Background → Page relay (extension-initiated pushes) ──────────
+// The scheduler in background.js can ask this tab to run a due routine
+// via a 'push' message — relay it down to the page unmodified.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== MARKER || msg.direction !== 'push') return false;
+  window.postMessage(msg, '*');
+  return false; // no response expected back through this channel
 });
 
 } // end double-injection guard

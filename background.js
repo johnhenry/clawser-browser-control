@@ -104,6 +104,11 @@ init();
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.type !== MARKER) return false;
 
+  if (msg.direction === 'notify') {
+    handleNotify(msg, sender);
+    return false; // fire-and-forget, no response expected
+  }
+
   if (inFlightCount >= MAX_CONCURRENT_ACTIONS) {
     console.warn(`[clawser-ext] Rejecting "${msg.action}" — ${inFlightCount} actions already in flight (limit ${MAX_CONCURRENT_ACTIONS})`);
     sendResponse({ error: `Too many concurrent requests (limit ${MAX_CONCURRENT_ACTIONS}) — try again shortly` });
@@ -1274,8 +1279,38 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 // ── Background Scheduler (Tier 1: chrome.alarms) ──────────────────
+//
+// This tier detects which routines are due and delegates *actual*
+// execution into a live Clawser tab — it cannot execute a routine's
+// action itself (no ES module imports in an MV3 service worker, and no
+// access to the page's orchestrator/gateway/agent objects even if it
+// could). See web/clawser-extension-routine-bridge.js in the main repo
+// for the page-side half of this handoff.
+//
+// Tab tracking: the page announces itself via a 'workspace_ready'
+// notify message (relayed by content.js) once its own agent has booted;
+// we remember that tab's id/url. When a routine is due:
+//   1. If the remembered tab is still open at the same URL, ask it to
+//      run the routine (push message) and wait for a 'routine_executed'
+//      notify back.
+//   2. Otherwise, if we at least know the workspace's URL, open a new
+//      background tab there, wait for its own 'workspace_ready', then
+//      do the same handoff — and close the tab we opened once done.
+//   3. If we've never seen a live workspace at all, log that execution
+//      was skipped rather than pretending it succeeded.
 
 const SCHEDULER_ALARM_NAME = 'clawser-scheduler';
+const ROUTINE_EXEC_TIMEOUT_MS = 30000;
+const TAB_OPEN_WAIT_MS = 20000;
+
+/** @type {{tabId: number, url: string, wsId: string|null, lastSeen: number}|null} */
+let lastKnownWorkspaceTab = null;
+
+/** @type {Map<string, {resolve: Function, timer: ReturnType<typeof setTimeout>}>} routineId -> pending execution */
+const pendingRoutineExecutions = new Map();
+
+/** @type {Map<number, Function>} tabId -> resolve fn, for tabs we're waiting on to report ready */
+const pendingReadyWaiters = new Map();
 
 // Set up the alarm on extension install/update
 chrome.runtime.onInstalled.addListener(() => {
@@ -1287,12 +1322,126 @@ chrome.runtime.onStartup?.addListener(() => {
   chrome.alarms.create(SCHEDULER_ALARM_NAME, { periodInMinutes: 1 });
 });
 
+/**
+ * Handle a fire-and-forget 'notify' message from a page (relayed by
+ * content.js) — workspace-ready announcements and routine-execution
+ * results, as opposed to the request/response RPC actions above.
+ */
+function handleNotify(msg, sender) {
+  const tabId = sender?.tab?.id;
+  const tabUrl = sender?.tab?.url;
+
+  if (msg.action === 'workspace_ready') {
+    if (tabId !== undefined && tabUrl) {
+      lastKnownWorkspaceTab = { tabId, url: tabUrl, wsId: msg.wsId || null, lastSeen: Date.now() };
+      const waiter = pendingReadyWaiters.get(tabId);
+      if (waiter) { pendingReadyWaiters.delete(tabId); waiter(); }
+    }
+  } else if (msg.action === 'routine_executed') {
+    const pending = pendingRoutineExecutions.get(msg.routineId);
+    if (pending) {
+      pendingRoutineExecutions.delete(msg.routineId);
+      clearTimeout(pending.timer);
+      pending.resolve({ success: !!msg.success, error: msg.error || null });
+    }
+  }
+}
+
+/** Ask a specific tab to run a routine now, and wait for its result. */
+function requestRoutineExecution(tabId, routineId) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingRoutineExecutions.delete(routineId);
+      resolve({ success: false, error: 'Timed out waiting for tab to execute routine' });
+    }, ROUTINE_EXEC_TIMEOUT_MS);
+    pendingRoutineExecutions.set(routineId, { resolve, timer });
+    chrome.tabs.sendMessage(tabId, { type: MARKER, direction: 'push', action: 'execute_routine', routineId })
+      .catch((e) => {
+        clearTimeout(timer);
+        pendingRoutineExecutions.delete(routineId);
+        resolve({ success: false, error: `Could not reach tab: ${e.message}` });
+      });
+  });
+}
+
+/**
+ * Execute a due routine by delegating to a live Clawser tab — the
+ * currently-known one if still open at the same URL, or a freshly
+ * opened one at the last-known workspace URL otherwise. Never throws;
+ * returns a description of what happened, including honest failure
+ * when no workspace has ever been seen.
+ * @returns {Promise<{success: boolean, error: string|null}>}
+ */
+async function delegateRoutineExecution(routineId) {
+  if (lastKnownWorkspaceTab) {
+    try {
+      const tab = await chrome.tabs.get(lastKnownWorkspaceTab.tabId);
+      if (tab && tab.url === lastKnownWorkspaceTab.url) {
+        return await requestRoutineExecution(lastKnownWorkspaceTab.tabId, routineId);
+      }
+    } catch {
+      // Tab no longer exists — fall through to (re)opening one below.
+    }
+  }
+
+  if (!lastKnownWorkspaceTab?.url) {
+    return { success: false, error: 'No known Clawser tab to execute this routine on (no live workspace has ever connected)' };
+  }
+
+  let openedTab;
+  try {
+    openedTab = await chrome.tabs.create({ url: lastKnownWorkspaceTab.url, active: false });
+  } catch (e) {
+    return { success: false, error: `Could not open a tab to run this routine: ${e.message}` };
+  }
+
+  const ready = await new Promise((resolve) => {
+    const timer = setTimeout(() => { pendingReadyWaiters.delete(openedTab.id); resolve(false); }, TAB_OPEN_WAIT_MS);
+    pendingReadyWaiters.set(openedTab.id, () => { clearTimeout(timer); resolve(true); });
+  });
+
+  const result = ready
+    ? await requestRoutineExecution(openedTab.id, routineId)
+    : { success: false, error: 'Opened a tab but it did not report ready in time' };
+
+  try { await chrome.tabs.remove(openedTab.id); } catch { /* best-effort cleanup */ }
+  return result;
+}
+
+// Cron field-range validation, ported from web/clawser-background-runner.js's
+// validateCronExpression() (can't import it — no ES modules in an MV3
+// service worker). Without this, a malformed expression silently never
+// matches, indistinguishable from "not due yet".
+const CRON_FIELD_RANGES = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]];
+
+function validateCronFieldRange(pattern, min, max) {
+  if (pattern === '*') return true;
+  if (pattern.startsWith('*/')) {
+    const step = parseInt(pattern.slice(2), 10);
+    return step > 0;
+  }
+  for (const v of pattern.split(',')) {
+    if (v.includes('-')) {
+      const [a, b] = v.split('-').map(Number);
+      if (Number.isNaN(a) || Number.isNaN(b) || a > b || a < min || b > max) return false;
+    } else {
+      const n = parseInt(v, 10);
+      if (Number.isNaN(n) || n < min || n > max) return false;
+    }
+  }
+  return true;
+}
+
+function validateCronExpressionInline(expr) {
+  if (typeof expr !== 'string' || !expr.trim()) return false;
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) return false;
+  return parts.every((p, i) => validateCronFieldRange(p, CRON_FIELD_RANGES[i][0], CRON_FIELD_RANGES[i][1]));
+}
+
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== SCHEDULER_ALARM_NAME) return;
 
-  // Import BackgroundSchedulerRunner from the web app via IndexedDB
-  // In a MV3 extension SW, we can't import ES modules. Instead, we
-  // read routine state from IndexedDB and execute due routines inline.
   try {
     const DB_NAME = 'clawser_checkpoints';
     const STORE = 'checkpoints';
@@ -1335,7 +1484,6 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     const nowDate = new Date(now);
     const results = [];
 
-    // Inline cron matching (can't import ES modules in MV3 service worker)
     function cronFieldMatches(pattern, value) {
       if (pattern === '*') return true;
       if (pattern.startsWith('*/')) {
@@ -1352,7 +1500,6 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     }
     function cronMatches(expr, date) {
       const parts = expr.trim().split(/\s+/);
-      if (parts.length < 5) return false;
       const fields = [date.getMinutes(), date.getHours(), date.getDate(), date.getMonth() + 1, date.getDay()];
       for (let i = 0; i < 5; i++) {
         if (!cronFieldMatches(parts[i], fields[i])) return false;
@@ -1360,41 +1507,48 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       return true;
     }
 
+    // Determine due routines first (sync), then execute them one at a
+    // time (async, potentially slow if a tab needs to be opened) so we
+    // don't race concurrent IDB writes against ourselves.
+    const due = [];
     for (const r of routines) {
       if (!r.enabled) continue;
-      let shouldFire = false;
 
-      // Cron check — evaluate the actual cron expression
       if (r.trigger?.type === 'cron' && r.trigger?.cron) {
+        if (!validateCronExpressionInline(r.trigger.cron)) {
+          console.warn(`[clawser-ext] Routine "${r.name || r.id}" has an invalid cron expression and will never fire: "${r.trigger.cron}"`);
+          continue;
+        }
         const lastMinute = r.state?.lastCronMinute || 0;
         const thisMinute = Math.floor(now / 60000);
-        if (thisMinute > lastMinute && cronMatches(r.trigger.cron, nowDate)) shouldFire = true;
+        if (thisMinute > lastMinute && cronMatches(r.trigger.cron, nowDate)) due.push(r);
+        continue;
       }
-      // Interval check
       if (r.meta?.scheduleType === 'interval') {
         const lastFired = r.meta.lastFired || 0;
-        if (now >= lastFired + (r.meta.intervalMs || 60000)) shouldFire = true;
+        if (now >= lastFired + (r.meta.intervalMs || 60000)) due.push(r);
+        continue;
       }
-      // Once check
       if (r.meta?.scheduleType === 'once' && !r.meta.fired && now >= (r.meta.fireAt || 0)) {
-        shouldFire = true;
+        due.push(r);
       }
+    }
 
-      if (shouldFire) {
-        r.state = r.state || {};
-        r.state.lastRun = now;
-        r.state.lastResult = 'background_executed';
-        r.state.runCount = (r.state.runCount || 0) + 1;
-        if (r.trigger?.type === 'cron') r.state.lastCronMinute = Math.floor(now / 60000);
-        if (r.meta?.scheduleType === 'interval') r.meta.lastFired = now;
-        if (r.meta?.scheduleType === 'once') r.meta.fired = true;
-        results.push({ routineId: r.id, result: 'background_executed' });
-      }
+    for (const r of due) {
+      const { success, error } = await delegateRoutineExecution(r.id);
+      r.state = r.state || {};
+      r.state.lastRun = Date.now();
+      r.state.lastResult = success ? 'executed' : `skipped: ${error}`;
+      r.state.runCount = (r.state.runCount || 0) + 1;
+      if (r.trigger?.type === 'cron') r.state.lastCronMinute = Math.floor(now / 60000);
+      if (r.meta?.scheduleType === 'interval') r.meta.lastFired = now;
+      if (r.meta?.scheduleType === 'once') r.meta.fired = true;
+      results.push({ routineId: r.id, success, error });
+      if (!success) console.warn(`[clawser-ext] Routine "${r.name || r.id}" not executed: ${error}`);
     }
 
     if (results.length > 0) {
       await write(ROUTINE_KEY, routines);
-      // Append to execution log
       const log = (await read(LOG_KEY)) || [];
       log.push({ timestamp: now, results });
       while (log.length > 100) log.shift();
