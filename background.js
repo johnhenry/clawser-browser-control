@@ -212,6 +212,10 @@ async function handleAction(action, params) {
     // ── Pod Injection ──
     case 'inject_pod': return actionInjectPod(params);
 
+    // ── GIF Recording ──
+    case 'gif_record_start': return actionGifRecordStart(params);
+    case 'gif_record_stop': return actionGifRecordStop(params);
+
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -1561,6 +1565,130 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     try { db?.close(); } catch { /* best-effort */ }
   }
 });
+
+// ── GIF Recording ─────────────────────────────────────────────────
+//
+// Chrome hard-caps chrome.tabs.captureVisibleTab at ~2 calls/second
+// (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND, unconditional, no
+// permission raises it), so frames are captured on a ~2Hz interval —
+// choppy for fast motion, fine for "click here, type this" interaction
+// recordings. Frames are held in memory as data URLs until encoding, so
+// recordings default to a short cap to bound memory use in a service
+// worker that can be killed for excess memory/CPU.
+
+/** @type {{tabId: number, windowId: number, frames: string[], maxFrames: number, delayCs: number, format: string, quality: number, timerId: ReturnType<typeof setInterval>}|null} */
+let gifRecordingState = null;
+
+async function actionGifRecordStart({ tabId, fps = 2, maxDurationSec = 15, format = 'jpeg', quality = 60 } = {}) {
+  if (gifRecordingState) throw new Error('A GIF recording is already in progress');
+  if (!(maxDurationSec > 0 && maxDurationSec <= 60)) throw new Error('maxDurationSec must be between 1 and 60');
+
+  const tid = await resolveTabId({ tabId });
+  const tab = await chrome.tabs.get(tid);
+  await chrome.tabs.update(tid, { active: true });
+  await chrome.windows.update(tab.windowId, { focused: true });
+
+  const effectiveFps = Math.min(fps, 2); // Chrome's hard cap
+  const intervalMs = Math.round(1000 / effectiveFps);
+  const maxFrames = Math.max(1, Math.floor((maxDurationSec * 1000) / intervalMs));
+
+  gifRecordingState = {
+    tabId: tid,
+    windowId: tab.windowId,
+    frames: [],
+    maxFrames,
+    delayCs: Math.round(intervalMs / 10), // GIF frame delay is in 1/100s units
+    format,
+    quality,
+    timerId: null,
+  };
+
+  gifRecordingState.timerId = setInterval(async () => {
+    if (!gifRecordingState) return;
+    if (gifRecordingState.frames.length >= gifRecordingState.maxFrames) {
+      actionGifRecordStop().catch((e) => console.warn('[clawser-ext] GIF auto-stop failed:', e.message));
+      return;
+    }
+    try {
+      const dataUrl = await chrome.tabs.captureVisibleTab(gifRecordingState.windowId, {
+        format: gifRecordingState.format,
+        quality: gifRecordingState.quality,
+      });
+      gifRecordingState.frames.push(dataUrl);
+    } catch {
+      // A transient rate-limit/quota error just drops one frame — a
+      // slightly choppier GIF beats aborting the whole recording.
+    }
+  }, intervalMs);
+
+  return { recording: true, tabId: tid, fps: effectiveFps, maxDurationSec, maxFrames };
+}
+
+async function actionGifRecordStop() {
+  if (!gifRecordingState) throw new Error('No GIF recording in progress');
+  clearInterval(gifRecordingState.timerId);
+  const { frames, delayCs } = gifRecordingState;
+  gifRecordingState = null;
+
+  if (frames.length === 0) return { dataUrl: null, format: 'gif', frameCount: 0 };
+
+  const dataUrl = await encodeFramesToGif(frames, delayCs);
+  return { dataUrl, format: 'gif', frameCount: frames.length };
+}
+
+/**
+ * Encode captured frames into an animated GIF using the vendored gifenc
+ * library. Chrome's MV3 service worker has no DOM/canvas to decode
+ * frames or draw to, so encoding happens in a short-lived offscreen
+ * document (chrome.offscreen — Chromium-only); Firefox's MV3 background
+ * page keeps real DOM access, so it's done inline there instead. The
+ * branch is feature-detected via chrome.offscreen's presence, not
+ * browser-sniffed.
+ */
+async function encodeFramesToGif(frames, delayCs) {
+  if (chrome.offscreen) {
+    await ensureOffscreenDocument();
+    let response;
+    try {
+      response = await chrome.runtime.sendMessage({ type: MARKER, target: 'offscreen', action: 'encode_gif', frames, delayCs });
+    } finally {
+      await chrome.offscreen.closeDocument().catch(() => {});
+    }
+    if (response?.error) throw new Error(response.error);
+    return response.dataUrl;
+  }
+
+  const { GIFEncoder, quantize, applyPalette } = await import('./gifenc.js');
+  const gif = GIFEncoder();
+  const canvas = new OffscreenCanvas(1, 1);
+  const ctx = canvas.getContext('2d');
+  for (const dataUrl of frames) {
+    const blob = await (await fetch(dataUrl)).blob();
+    const bitmap = await createImageBitmap(blob);
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    ctx.drawImage(bitmap, 0, 0);
+    const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const palette = quantize(data, 256);
+    const index = applyPalette(data, palette);
+    gif.writeFrame(index, width, height, { palette, delay: delayCs });
+  }
+  gif.finish();
+  const bytes = gif.bytes();
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return 'data:image/gif;base64,' + btoa(binary);
+}
+
+async function ensureOffscreenDocument() {
+  const existing = await chrome.runtime.getContexts?.({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (existing && existing.length > 0) return;
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['DOM_SCRAPING'],
+    justification: 'Decode captured screenshot frames and encode an animated GIF via canvas — unavailable in the service worker.',
+  });
+}
 
 // ── Pod Injection ───────────────────────────────────────────────
 

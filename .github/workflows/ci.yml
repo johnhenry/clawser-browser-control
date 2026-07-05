@@ -12,16 +12,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate manifest
+      - name: Validate manifests (Chrome + Firefox)
         run: |
           node -e "
             const m = JSON.parse(require('fs').readFileSync('manifest.json', 'utf8'));
-            console.log('Name:', m.name);
-            console.log('Version:', m.version);
-            console.log('MV:', m.manifest_version);
+            console.log('Chrome — Name:', m.name, 'Version:', m.version, 'MV:', m.manifest_version);
             if (m.manifest_version !== 3) throw new Error('Expected MV3');
             if (!m.background?.service_worker) throw new Error('Missing service worker');
-            console.log('Manifest valid');
+            console.log('Chrome manifest valid');
+
+            const f = JSON.parse(require('fs').readFileSync('firefox/manifest.json', 'utf8'));
+            console.log('Firefox — Name:', f.name, 'Version:', f.version, 'MV:', f.manifest_version);
+            if (f.manifest_version !== 3) throw new Error('Expected MV3');
+            if (!f.background?.scripts) throw new Error('Missing background scripts');
+            if (f.version !== m.version) throw new Error(\`Version mismatch: chrome=\${m.version} firefox=\${f.version}\`);
+            console.log('Firefox manifest valid');
           "
 
       - name: Check required files exist
@@ -29,6 +34,9 @@ jobs:
           test -f background.js || (echo "Missing background.js" && exit 1)
           test -f content.js || (echo "Missing content.js" && exit 1)
           test -f pod-inject.js || (echo "Missing pod-inject.js" && exit 1)
+          test -f gifenc.js || (echo "Missing gifenc.js" && exit 1)
+          test -f offscreen.html || (echo "Missing offscreen.html" && exit 1)
+          test -f offscreen.js || (echo "Missing offscreen.js" && exit 1)
           test -f icons/icon-16.png || (echo "Missing icon-16" && exit 1)
           test -f icons/icon-48.png || (echo "Missing icon-48" && exit 1)
           test -f icons/icon-128.png || (echo "Missing icon-128" && exit 1)
@@ -38,6 +46,6 @@ jobs:
         run: |
           mkdir -p dist
           zip -r dist/clawser-browser-control.zip \
-            manifest.json background.js content.js pod-inject.js icons/ \
+            manifest.json background.js content.js pod-inject.js gifenc.js offscreen.html offscreen.js icons/ \
             -x "*.DS_Store"
           ls -lh dist/clawser-browser-control.zip

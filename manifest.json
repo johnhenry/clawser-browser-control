@@ -13,7 +13,8 @@
     "webRequest",
     "cookies",
     "storage",
-    "alarms"
+    "alarms",
+    "offscreen"
   ],
   "optional_permissions": ["debugger"],
   "host_permissions": ["<all_urls>"],
