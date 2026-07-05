@@ -32,11 +32,11 @@ Required to persist extension configuration settings (e.g., connection preferenc
 
 alarms
 ------
-Required to schedule periodic background tasks such as heartbeat checks to maintain the connection between the extension and the local Clawser workspace.
+Required to periodically check whether a scheduled Clawser routine is due to run, so routines can still fire on a schedule even when no Clawser tab is currently open.
 
 debugger (optional)
 -------------------
-Optionally requested when the user enables advanced browser inspection features. Provides Chrome DevTools Protocol access for detailed page debugging. Only activated with explicit user consent.
+Reserved for a future advanced browser-inspection feature (Chrome DevTools Protocol access for detailed page debugging). Not currently used by any action — declared as optional so it can be requested with explicit user consent if that feature ships.
 
 Host permissions: <all_urls>
 ----------------------------
@@ -58,7 +58,7 @@ This extension bridges your local Clawser workspace with full browser capabiliti
 • Screenshots — Capture full-page or viewport screenshots for agent analysis
 • DOM Access — Read, query, and interact with live page elements
 • Input Simulation — Click buttons, fill forms, type text, and scroll pages
-• Network Monitoring — Observe requests and responses for debugging
+• Network Monitoring — Observe request metadata (URL, method, status, type) for debugging
 • Cookie Access — Relay authentication state for working with logged-in sites
 
 How it works:

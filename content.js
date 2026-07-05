@@ -71,18 +71,40 @@ const _presenceInterval = setInterval(async () => {
 }, 5000);
 
 // ── Page → Background relay ──────────────────────────────────────
+
+// Upper bound on how long we'll wait for the background service worker to
+// respond. Without this, a hung/crashed background leaves the page's
+// caller awaiting forever — chrome.runtime.sendMessage's own promise only
+// rejects if the message port actually closes, not if the receiving end
+// simply never calls sendResponse.
+const RELAY_TIMEOUT_MS = 35000;
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`Extension did not respond within ${ms}ms`)), ms)),
+  ]);
+}
+
 window.addEventListener('message', async (ev) => {
   if (ev.source !== window) return;
   const msg = ev.data;
   if (!msg || msg.type !== MARKER || msg.direction !== 'request') return;
+  if (msg.id === undefined || msg.id === null) {
+    console.warn('[clawser-ext] Ignoring request with no id — the page won\'t be able to correlate a response:', msg.action);
+    return;
+  }
 
   try {
-    const response = await chrome.runtime.sendMessage({
-      type: MARKER,
-      id: msg.id,
-      action: msg.action,
-      params: msg.params,
-    });
+    const response = await withTimeout(
+      chrome.runtime.sendMessage({
+        type: MARKER,
+        id: msg.id,
+        action: msg.action,
+        params: msg.params,
+      }),
+      RELAY_TIMEOUT_MS,
+    );
 
     window.postMessage({
       type: MARKER,

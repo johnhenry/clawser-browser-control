@@ -18,11 +18,11 @@ Chrome extension that gives the [Clawser](https://github.com/johnhenry/clawser) 
 
 ## Architecture
 
-- `background.js` — MV3 service worker handling tab orchestration, screenshots, and DevTools protocol
-- `content.js` — content script injected into matching pages for DOM access
+- `background.js` — MV3 service worker handling tab orchestration, screenshots, input simulation, and the routine scheduler
+- `content.js` — content script injected into matching pages, relaying page <-> extension RPC
 - `pod-inject.js` — web-accessible script that bridges the Clawser pod runtime with the extension
 - `manifest.json` — Chrome MV3 manifest (minimum Chrome 135)
-- `firefox/manifest.json` — Firefox-compatible manifest
+- `firefox/manifest.json` — Firefox MV3 manifest (minimum Firefox 128)
 
 ## Development
 

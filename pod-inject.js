@@ -1,5 +1,15 @@
 // pod-inject.js — Auto-generated IIFE bundle for Chrome extension injection.
-// Do not edit directly. Regenerate with: bash web/packages/pod/build.sh
+// Do not edit directly.
+//
+// The build script this was originally generated from
+// (web/packages/pod/build.sh in the main clawser repo) no longer exists —
+// that code was migrated to the `browsermesh-pod` npm package (see
+// web/packages-pod.js's `InjectedPod` re-export). This bundle has not
+// been regenerated since that migration and its exact source commit is
+// no longer known; treat it as a known drift risk (tracked in
+// johnhenry/clawser-browser-control#10) until a new bundling step is
+// built against `browsermesh-pod` directly and this comment is replaced
+// with a real source marker.
 (function() {
 'use strict';
 if (globalThis[Symbol.for('pod.runtime')]) return;
