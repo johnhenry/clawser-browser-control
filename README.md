@@ -34,6 +34,18 @@ Load as an unpacked extension:
 2. Enable "Developer mode"
 3. Click "Load unpacked" and select this directory
 
+### Tests
+
+```
+npm test
+```
+
+`background.js` and `content.js` are plain (non-module) scripts with no build
+step, so `test/_load-background.mjs` and `test/_load-content.mjs` load the
+real, unmodified source into an isolated `node:vm` context with a stubbed
+`chrome` API per test — no browser or headless runner required. This is test
+tooling only; the shipped extension has no runtime dependencies.
+
 ## Publishing
 
 Releases are automated via GitHub Actions. Push a version tag to trigger a build, Chrome Web Store upload, and GitHub Release.

@@ -1,0 +1,9 @@
+{
+  "name": "clawser-browser-control",
+  "private": true,
+  "type": "module",
+  "description": "Test tooling only — the shipped extension has no build step or runtime dependencies. See README.md.",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
