@@ -56,11 +56,11 @@ gh secret set CWS_REFRESH_TOKEN --repo johnhenry/clawser-browser-control --body 
 
 ### Releasing a new version
 
-1. Bump the version in `manifest.json`
+1. Bump the version in **both** `manifest.json` and `firefox/manifest.json` — keep them in sync
 2. Commit and tag:
 
 ```bash
-git add manifest.json
+git add manifest.json firefox/manifest.json
 git commit -m "release: v0.1.1"
 git tag v0.1.1
 git push origin main --tags

@@ -1,35 +1,44 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "name": "Clawser Browser Control",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Gives the Clawser agent real browser control: tabs, screenshots, DOM, input, monitoring.",
 
-  "applications": {
+  "browser_specific_settings": {
     "gecko": {
       "id": "clawser@clawser.dev",
-      "strict_min_version": "109.0"
+      "strict_min_version": "128.0"
     }
   },
 
   "permissions": [
     "tabs",
     "activeTab",
+    "scripting",
+    "userScripts",
     "webRequest",
     "cookies",
     "storage",
-    "<all_urls>"
+    "alarms"
   ],
+  "host_permissions": ["<all_urls>"],
 
   "background": {
-    "scripts": ["background.js"],
-    "persistent": false
+    "scripts": ["background.js"]
   },
 
   "content_scripts": [
     {
-      "matches": ["*://localhost/*", "*://127.0.0.1/*", "file:///*"],
+      "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_idle"
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["pod-inject.js"],
+      "matches": ["<all_urls>"]
     }
   ],
 
