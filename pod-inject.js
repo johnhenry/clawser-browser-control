@@ -1,20 +1,19 @@
-// pod-inject.js — Auto-generated IIFE bundle for Chrome extension injection.
-// Do not edit directly.
+// pod-inject.js — Auto-generated IIFE bundle for Chrome/Firefox extension
+// injection (chrome.scripting.executeScript world: 'MAIN'). Do not edit
+// directly — regenerate with: node scripts/build-pod-inject.mjs
 //
-// The build script this was originally generated from
-// (web/packages/pod/build.sh in the main clawser repo) no longer exists —
-// that code was migrated to the `browsermesh-pod` npm package (see
-// web/packages-pod.js's `InjectedPod` re-export). This bundle has not
-// been regenerated since that migration and its exact source commit is
-// no longer known; treat it as a known drift risk (tracked in
-// johnhenry/clawser-browser-control#10) until a new bundling step is
-// built against `browsermesh-pod` directly and this comment is replaced
-// with a real source marker.
+// Bundled from:
+//   browsermesh-pod@0.1.0
+//   browsermesh-primitives@0.1.0
+// (versions pinned in package.json devDependencies; regenerate after bumping
+// either package there — CI fails if this file drifts from what the build
+// script produces, so there's no separate generation-date stamp to keep in
+// sync; git blame on this file is the generation-date record.)
 (function() {
 'use strict';
 if (globalThis[Symbol.for('pod.runtime')]) return;
 
-// ── mesh-primitives/identity.mjs ──
+// ── browsermesh-primitives/identity.mjs ──
 /**
  * Encode a Uint8Array as a base64url string (no padding).
  *
@@ -113,7 +112,7 @@ class PodIdentity {
   }
 }
 
-// ── pod/detect-kind.mjs ──
+// ── browsermesh-pod/detect-kind.mjs ──
 /**
  * detect-kind.mjs — Classify the current execution context.
  *
@@ -170,7 +169,7 @@ function detectPodKind(g = globalThis) {
   return 'window'
 }
 
-// ── pod/capabilities.mjs ──
+// ── browsermesh-pod/capabilities.mjs ──
 /**
  * capabilities.mjs — Detect available browser/runtime capabilities.
  *
@@ -235,7 +234,7 @@ function detectCapabilities(g = globalThis) {
   }
 }
 
-// ── pod/messages.mjs ──
+// ── browsermesh-pod/messages.mjs ──
 /**
  * messages.mjs — Pod wire protocol message types and factories.
  *
@@ -372,7 +371,7 @@ function createRpcResponse({ from, to, requestId, result, error }) {
   }
 }
 
-// ── pod/pod.mjs ──
+// ── browsermesh-pod/pod.mjs ──
 /**
  * pod.mjs — Pod base class.
  *
@@ -381,13 +380,8 @@ function createRpcResponse({ from, to, requestId, result, error }) {
  * 6-phase BrowserMesh boot sequence: Install Runtime → Install Listeners →
  * Self-Classification → Parent Handshake → Peer Discovery → Role Finalization.
  *
- * Zero Clawser imports — depends only on mesh-primitives for identity.
+ * Zero Clawser imports — depends only on browsermesh-primitives for identity.
  */
-
-  POD_HELLO, POD_HELLO_ACK, POD_GOODBYE, POD_MESSAGE,
-  POD_RPC_REQUEST, POD_RPC_RESPONSE,
-  createHello, createHelloAck, createGoodbye, createMessage,
-} from './messages.mjs'
 
 const POD_RUNTIME_KEY = Symbol.for('pod.runtime')
 const DEFAULT_HANDSHAKE_TIMEOUT = 1000
@@ -783,7 +777,7 @@ class Pod {
   }
 }
 
-// ── pod/injected-pod.mjs ──
+// ── browsermesh-pod/injected-pod.mjs ──
 /**
  * injected-pod.mjs — Lightweight pod for injection into arbitrary pages.
  *
@@ -791,7 +785,6 @@ class Pod {
  * data extraction, and a visual overlay indicator. Designed for Chrome
  * extension injection or bookmarklet use.
  */
-
 
 const OVERLAY_ID = '__pod_overlay__'
 

@@ -2,8 +2,13 @@
   "name": "clawser-browser-control",
   "private": true,
   "type": "module",
-  "description": "Test tooling only — the shipped extension has no build step or runtime dependencies. See README.md.",
+  "description": "Test/build tooling only — the shipped extension has no build step or runtime dependencies. See README.md.",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "build:pod-inject": "node scripts/build-pod-inject.mjs"
+  },
+  "devDependencies": {
+    "browsermesh-pod": "^0.1.0",
+    "browsermesh-primitives": "^0.1.0"
   }
 }

@@ -20,7 +20,7 @@ Chrome extension that gives the [Clawser](https://github.com/johnhenry/clawser) 
 
 - `background.js` — MV3 service worker handling tab orchestration, screenshots, input simulation, and the routine scheduler
 - `content.js` — content script injected into matching pages, relaying page <-> extension RPC
-- `pod-inject.js` — web-accessible script that bridges the Clawser pod runtime with the extension
+- `pod-inject.js` — web-accessible script that bridges the Clawser pod runtime with the extension. Generated from the `browsermesh-pod`/`browsermesh-primitives` npm packages by `scripts/build-pod-inject.mjs` (`npm run build:pod-inject`) — do not edit directly; bump the pinned versions in `package.json` and regenerate instead.
 - `gifenc.js` — vendored GIF encoder (see THIRD-PARTY-LICENSES.md), used for GIF recording
 - `offscreen.html` / `offscreen.js` — Chrome-only offscreen document that decodes captured frames and encodes them into a GIF (a service worker has no DOM/canvas to do this itself); Firefox's MV3 background page keeps DOM access, so it encodes inline instead
 - `manifest.json` — Chrome MV3 manifest (minimum Chrome 135)
