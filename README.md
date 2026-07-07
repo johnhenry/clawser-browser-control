@@ -90,8 +90,8 @@ git push origin main --tags
 If you need to publish manually (e.g. first submission before CI secrets are set):
 
 ```bash
-# Build the zip
-zip -r clawser-browser-control.zip manifest.json background.js content.js pod-inject.js gifenc.js offscreen.html offscreen.js icons/ -x "*.DS_Store"
+# Build the zip (file list shared with CI/publish workflows)
+zip -r clawser-browser-control.zip -@ -x "*.DS_Store" < scripts/dist-files.txt
 
 # Upload at https://chrome.google.com/webstore/devconsole
 ```

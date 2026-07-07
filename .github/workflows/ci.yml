@@ -60,9 +60,9 @@ jobs:
           echo "All required files present"
 
       - name: Build zip (dry run)
+        # Same file list as publish.yml's real release zip (scripts/dist-files.txt)
+        # so a file present here is guaranteed present in the shipped zip.
         run: |
           mkdir -p dist
-          zip -r dist/clawser-browser-control.zip \
-            manifest.json background.js content.js pod-inject.js gifenc.js offscreen.html offscreen.js icons/ \
-            -x "*.DS_Store"
+          zip -r dist/clawser-browser-control.zip -@ -x "*.DS_Store" < scripts/dist-files.txt
           ls -lh dist/clawser-browser-control.zip

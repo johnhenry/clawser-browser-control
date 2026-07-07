@@ -15,15 +15,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build extension zip
+        # File list lives in scripts/dist-files.txt — shared with ci.yml's
+        # dry-run zip so the two can't drift apart (a runtime file missing
+        # from only this list once shipped a broken release, see #14).
         run: |
           mkdir -p dist
-          zip -r dist/clawser-browser-control.zip \
-            manifest.json \
-            background.js \
-            content.js \
-            pod-inject.js \
-            icons/ \
-            -x "*.DS_Store"
+          zip -r dist/clawser-browser-control.zip -@ -x "*.DS_Store" < scripts/dist-files.txt
 
       - name: Upload to Chrome Web Store
         uses: mnao305/chrome-extension-upload@v5.0.0
