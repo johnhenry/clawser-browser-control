@@ -8,7 +8,7 @@
     "build:pod-inject": "node scripts/build-pod-inject.mjs"
   },
   "devDependencies": {
-    "browsermesh-pod": "^0.1.0",
+    "browsermesh-pod": "^0.2.1",
     "browsermesh-primitives": "^0.1.0"
   }
 }

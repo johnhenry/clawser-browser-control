@@ -3,8 +3,8 @@
 // directly — regenerate with: node scripts/build-pod-inject.mjs
 //
 // Bundled from:
-//   browsermesh-pod@0.1.0
-//   browsermesh-primitives@0.1.0
+//   browsermesh-pod@0.2.1
+//   browsermesh-primitives@0.1.1
 // (versions pinned in package.json devDependencies; regenerate after bumping
 // either package there — CI fails if this file drifts from what the build
 // script produces, so there's no separate generation-date stamp to keep in
@@ -375,10 +375,15 @@ function createRpcResponse({ from, to, requestId, result, error }) {
 /**
  * pod.mjs — Pod base class.
  *
- * A Pod is any browser execution context that can execute code, receive
- * messages, and be discovered/addressed. This base class implements the
- * 6-phase BrowserMesh boot sequence: Install Runtime → Install Listeners →
- * Self-Classification → Parent Handshake → Peer Discovery → Role Finalization.
+ * A Pod is any execution context (browser tab, worker, Node.js process) that
+ * can execute code, receive messages, and be discovered/addressed. This base
+ * class implements the 6-phase BrowserMesh boot sequence: Install Runtime →
+ * Install Listeners → Self-Classification → Parent Handshake → Peer Discovery
+ * → Role Finalization.
+ *
+ * Transport and discovery are pluggable via adapter objects passed to boot().
+ * When no adapters are provided, Pod auto-detects: BroadcastChannel in browsers,
+ * NullTransport/NullDiscovery in Node.js.
  *
  * Zero Clawser imports — depends only on browsermesh-primitives for identity.
  */
@@ -399,7 +404,8 @@ class Pod {
   #state = 'idle'
   #peers = new Map()
   #listeners = new Map()
-  #discoveryChannel = null
+  #transport = null
+  #discovery = null
   #messageHandler = null
   #g = null
 
@@ -426,14 +432,19 @@ class Pod {
   /** @returns {Map<string, object>} podId → peer info */
   get peers() { return new Map(this.#peers) }
 
+  /** @returns {import('./transport.mjs').BroadcastChannelTransport|import('./transport.mjs').EventEmitterTransport|import('./transport.mjs').NullTransport|null} */
+  get transport() { return this.#transport }
+
   // ── Boot ─────────────────────────────────────────────────────
 
   /**
    * Run the 6-phase boot sequence.
    *
    * @param {object} [opts]
-   * @param {PodIdentity} [opts.identity] - Pre-existing identity (skips generation)
-   * @param {string} [opts.discoveryChannel] - BroadcastChannel name
+   * @param {PodIdentity|{podId: string}} [opts.identity] - Pre-existing identity (skips generation)
+   * @param {object} [opts.transport] - TransportAdapter instance (auto-detected if omitted)
+   * @param {object} [opts.discovery] - DiscoveryAdapter instance (auto-created if omitted)
+   * @param {string} [opts.discoveryChannel] - BroadcastChannel name (used by auto-created transport)
    * @param {number} [opts.handshakeTimeout] - ms to wait for parent ACK
    * @param {number} [opts.discoveryTimeout] - ms to wait for peer responses
    * @param {object} [opts.globalThis] - Override globalThis for testing
@@ -447,7 +458,7 @@ class Pod {
 
     try {
       // Phase 0: Install Runtime
-      this.#emit('phase', { phase: 0, name: 'install-runtime' })
+      this._emit('phase', { phase: 0, name: 'install-runtime' })
       this.#identity = opts.identity || await PodIdentity.generate()
       this.#kind = detectPodKind(this.#g)
       this.#capabilities = detectCapabilities(this.#g)
@@ -459,34 +470,30 @@ class Pod {
       }
 
       // Phase 1: Install Listeners
-      this.#emit('phase', { phase: 1, name: 'install-listeners' })
+      this._emit('phase', { phase: 1, name: 'install-listeners' })
       this.#installMessageHandler()
       this._onInstallListeners(this.#g)
 
       // Phase 2: Self-Classification
-      this.#emit('phase', { phase: 2, name: 'self-classification' })
-      // Subclasses can override _onInstallListeners to add handlers
+      this._emit('phase', { phase: 2, name: 'self-classification' })
 
       // Phase 3: Parent Handshake
-      this.#emit('phase', { phase: 3, name: 'parent-handshake' })
+      this._emit('phase', { phase: 3, name: 'parent-handshake' })
       await this.#parentHandshake(opts.handshakeTimeout ?? DEFAULT_HANDSHAKE_TIMEOUT)
 
       // Phase 4: Peer Discovery
-      this.#emit('phase', { phase: 4, name: 'peer-discovery' })
-      await this.#peerDiscovery(
-        opts.discoveryChannel ?? DEFAULT_DISCOVERY_CHANNEL,
-        opts.discoveryTimeout ?? DEFAULT_DISCOVERY_TIMEOUT
-      )
+      this._emit('phase', { phase: 4, name: 'peer-discovery' })
+      await this.#peerDiscovery(opts)
 
       // Phase 5: Role Finalization
-      this.#emit('phase', { phase: 5, name: 'role-finalization' })
+      this._emit('phase', { phase: 5, name: 'role-finalization' })
       this.#finalizeRole()
       this.#state = 'ready'
       this._onReady()
-      this.#emit('ready', { podId: this.podId, kind: this.#kind, role: this.#role })
+      this._emit('ready', { podId: this.podId, kind: this.#kind, role: this.#role })
     } catch (err) {
       this.#state = 'idle'
-      this.#emit('error', { phase: 'boot', error: err })
+      this._emit('error', { phase: 'boot', error: err })
       throw err
     }
   }
@@ -502,16 +509,19 @@ class Pod {
   async shutdown(opts = {}) {
     if (this.#state === 'shutdown' || this.#state === 'idle') return
 
-    if (!opts.silent && this.#discoveryChannel) {
-      try {
-        this.#discoveryChannel.postMessage(createGoodbye({ podId: this.podId }))
-      } catch { /* channel may already be closed */ }
+    if (this.#discovery) {
+      await this.#discovery.stop({ silent: opts.silent })
+      this.#discovery = null
+    } else if (this.#transport) {
+      // No discovery adapter — close transport directly
+      if (!opts.silent) {
+        try {
+          this.#transport.send(createGoodbye({ podId: this.podId }))
+        } catch { /* transport may already be closed */ }
+      }
+      await this.#transport.close()
     }
-
-    if (this.#discoveryChannel) {
-      this.#discoveryChannel.close()
-      this.#discoveryChannel = null
-    }
+    this.#transport = null
 
     if (this.#messageHandler && this.#g?.removeEventListener) {
       this.#g.removeEventListener('message', this.#messageHandler)
@@ -524,13 +534,13 @@ class Pod {
 
     this.#peers.clear()
     this.#state = 'shutdown'
-    this.#emit('shutdown', { podId: this.podId })
+    this._emit('shutdown', { podId: this.podId })
   }
 
   // ── Messaging ────────────────────────────────────────────────
 
   /**
-   * Send a message to a specific peer via BroadcastChannel.
+   * Send a message to a specific peer via the transport.
    *
    * @param {string} targetPodId
    * @param {*} payload
@@ -539,16 +549,16 @@ class Pod {
     if (this.#state !== 'ready') {
       throw new Error('Pod is not ready')
     }
-    if (!this.#discoveryChannel) {
-      throw new Error('No discovery channel available')
+    if (!this.#transport) {
+      throw new Error('No transport available')
     }
-    this.#discoveryChannel.postMessage(
+    this.#transport.send(
       createMessage({ from: this.podId, to: targetPodId, payload })
     )
   }
 
   /**
-   * Broadcast a message to all peers via BroadcastChannel.
+   * Broadcast a message to all peers via the transport.
    *
    * @param {*} payload
    */
@@ -626,7 +636,6 @@ class Pod {
   }
 
   async #parentHandshake(timeout) {
-    // Only attempt if we have a parent or opener
     const hasParent = this.#kind === 'iframe' || this.#kind === 'spawned'
     if (!hasParent) return
 
@@ -660,49 +669,51 @@ class Pod {
     })
   }
 
-  async #peerDiscovery(channelName, timeout) {
-    if (!this.#capabilities?.messaging?.broadcastChannel) return
+  async #peerDiscovery(opts) {
+    const channelName = opts.discoveryChannel ?? DEFAULT_DISCOVERY_CHANNEL
+    const timeout = opts.discoveryTimeout ?? DEFAULT_DISCOVERY_TIMEOUT
 
-    this.#discoveryChannel = new (this.#g.BroadcastChannel || BroadcastChannel)(channelName)
+    // Use provided transport or auto-detect
+    if (opts.transport) {
+      this.#transport = opts.transport
+    } else if (this.#capabilities?.messaging?.broadcastChannel) {
+      const BC = this.#g.BroadcastChannel || globalThis.BroadcastChannel
+      this.#transport = new BroadcastChannelTransport(channelName, BC)
+    } else {
+      this.#transport = new NullTransport()
+    }
 
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(), timeout)
+    // Use provided discovery or create one based on transport
+    if (opts.discovery) {
+      this.#discovery = opts.discovery
+    } else if (!(this.#transport instanceof NullTransport)) {
+      this.#discovery = new TransportDiscovery({
+        transport: this.#transport,
+        localPodId: this.podId,
+        localKind: this.#kind,
+        capabilities: this.#capabilities,
+        timeout,
+      })
+    } else {
+      this.#discovery = new NullDiscovery()
+    }
 
-      this.#discoveryChannel.onmessage = (event) => {
-        const data = event.data
-        if (!data || !data.type) return
-
-        if (data.type === POD_HELLO && data.podId !== this.podId) {
-          // Another pod announcing — respond with ACK and register
-          this.#addPeer(data.podId, { kind: data.kind })
-          this.#discoveryChannel.postMessage(
-            createHelloAck({ podId: this.podId, kind: this.#kind, targetPodId: data.podId })
-          )
-        } else if (data.type === POD_HELLO_ACK && data.targetPodId === this.podId) {
-          // Response to our announcement
-          this.#addPeer(data.podId, { kind: data.kind })
-        } else if (data.type === POD_GOODBYE) {
-          this.#removePeer(data.podId)
-        } else {
-          this.#handleIncoming(data)
-        }
-      }
-
-      // Announce ourselves
-      this.#discoveryChannel.postMessage(
-        createHello({ podId: this.podId, kind: this.#kind, capabilities: this.#capabilities })
-      )
-
-      // After timeout, switch to persistent listener
-      setTimeout(() => {
-        clearTimeout(timer)
-        resolve()
-      }, timeout)
+    // Wire discovery callbacks
+    this.#discovery.onPeerDiscovered((info) => {
+      this.#addPeer(info.podId, { kind: info.kind })
     })
+    this.#discovery.onPeerLost((info) => {
+      this.#removePeer(info.podId)
+    })
+    this.#discovery.onMessage((msg) => {
+      this.#handleIncoming(msg)
+    })
+
+    // Run discovery
+    await this.#discovery.start()
   }
 
   #finalizeRole() {
-    // If role was set during parent handshake, keep it
     if (this.#role === 'child') return
 
     if (this.#peers.size === 0) {
@@ -717,11 +728,10 @@ class Pod {
   #handleIncoming(data) {
     switch (data.type) {
       case POD_HELLO: {
-        // Late hello from a new peer (after initial discovery)
         if (data.podId !== this.podId) {
           this.#addPeer(data.podId, { kind: data.kind })
-          if (this.#discoveryChannel) {
-            this.#discoveryChannel.postMessage(
+          if (this.#transport) {
+            this.#transport.send(
               createHelloAck({ podId: this.podId, kind: this.#kind, targetPodId: data.podId })
             )
           }
@@ -741,10 +751,9 @@ class Pod {
       case POD_MESSAGE:
       case POD_RPC_REQUEST:
       case POD_RPC_RESPONSE: {
-        // Deliver if addressed to us or broadcast
         if (data.to === this.podId || data.to === '*') {
           this._onMessage(data)
-          this.#emit('message', data)
+          this._emit('message', data)
         }
         break
       }
@@ -756,19 +765,22 @@ class Pod {
     const isNew = !this.#peers.has(podId)
     this.#peers.set(podId, { ...info, podId, lastSeen: Date.now() })
     if (isNew) {
-      this.#emit('peer:found', { podId, ...info })
+      this._emit('peer:found', { podId, ...info })
     }
   }
 
   #removePeer(podId) {
     if (this.#peers.delete(podId)) {
-      this.#emit('peer:lost', { podId })
+      this._emit('peer:lost', { podId })
     }
   }
 
-  // ── Private: event emitter ───────────────────────────────────
+  // ── Protected: event emitter ─────────────────────────────────
+  // Underscore-prefixed by convention, not a JS #private field: subclasses
+  // (e.g. InjectedPod) need to dispatch events through the same listener
+  // registry that on()/off() populate.
 
-  #emit(event, data) {
+  _emit(event, data) {
     const list = this.#listeners.get(event)
     if (!list) return
     for (const fn of list) {
@@ -907,19 +919,10 @@ class InjectedPod extends Pod {
     this.emit('pod:message', msg)
   }
 
-  /** Emit helper for subclass/external use */
+  /** Emit helper for subclass/external use — dispatches through the same
+   *  listener registry that on()/off() populate. */
   emit(event, data) {
-    // Use the parent's on/off system by invoking listeners directly
-    // This is a public-facing emit that mirrors the internal #emit
-    const listeners = []
-    // Call registered listeners via a temporary capture
-    this._emitPublic(event, data)
-  }
-
-  /** @internal */
-  _emitPublic(event, data) {
-    // Pod base class has private #emit; we re-dispatch through on() listeners
-    // by using a workaround: store listeners we can call
+    this._emit(event, data)
   }
 
   /** @internal — access the global reference set during boot */
