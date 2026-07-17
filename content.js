@@ -58,17 +58,46 @@ async function announcePresence() {
 // Announce on load and periodically (handles SPA navigation).
 // Refresh capabilities each cycle in case permissions changed.
 // Stops itself when the extension runtime is invalidated.
+//
+// content.js matches <all_urls>, so this heartbeat would otherwise run on
+// every page the user visits, forever, keeping the MV3 service worker warm
+// globally even on tabs that will never host Clawser. Pause it while the
+// tab is hidden (backgrounded/minimized) — the common case for most open
+// tabs most of the time — and resume on visibility, rather than running
+// unconditionally.
+let _presenceInterval = null;
+
+function startPresenceHeartbeat() {
+  if (_presenceInterval !== null) return;
+  _presenceInterval = setInterval(async () => {
+    _cachedCaps = await queryCapabilities();
+    if (_cachedCaps === null) {
+      // Extension was disabled/uninstalled — stop heartbeating
+      stopPresenceHeartbeat();
+      console.log('[clawser-ext] Runtime gone, stopped presence');
+      return;
+    }
+    announcePresence();
+  }, 5000);
+}
+
+function stopPresenceHeartbeat() {
+  if (_presenceInterval === null) return;
+  clearInterval(_presenceInterval);
+  _presenceInterval = null;
+}
+
 announcePresence().then(() => console.log('[clawser-ext] Initial presence announced'));
-const _presenceInterval = setInterval(async () => {
-  _cachedCaps = await queryCapabilities();
-  if (_cachedCaps === null) {
-    // Extension was disabled/uninstalled — stop heartbeating
-    clearInterval(_presenceInterval);
-    console.log('[clawser-ext] Runtime gone, stopped presence');
-    return;
+if (!document.hidden) startPresenceHeartbeat();
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopPresenceHeartbeat();
+  } else {
+    announcePresence();
+    startPresenceHeartbeat();
   }
-  announcePresence();
-}, 5000);
+});
 
 // ── Page → Background relay ──────────────────────────────────────
 

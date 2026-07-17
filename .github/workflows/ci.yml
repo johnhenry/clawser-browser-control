@@ -66,3 +66,13 @@ jobs:
           mkdir -p dist
           zip -r dist/clawser-browser-control.zip -@ -x "*.DS_Store" < scripts/dist-files.txt
           ls -lh dist/clawser-browser-control.zip
+
+      - name: Build Firefox zip (dry run)
+        # Mirrors publish.yml's Firefox zip step so drift is caught on every push.
+        run: |
+          mkdir -p dist/firefox-stage
+          grep -v '^manifest\.json$' scripts/dist-files.txt > /tmp/firefox-dist-files.txt
+          cp -r $(cat /tmp/firefox-dist-files.txt) dist/firefox-stage/
+          cp firefox/manifest.json dist/firefox-stage/manifest.json
+          (cd dist/firefox-stage && zip -r ../clawser-browser-control-firefox.zip . -x "*.DS_Store")
+          ls -lh dist/clawser-browser-control-firefox.zip

@@ -29,7 +29,8 @@ const MARKER = '__clawser_ext__';
  *   race, so tests can substitute an immediate-fire version to exercise the
  *   timeout path without a real 35s wait — no interaction with the presence
  *   heartbeat, which uses setInterval, not setTimeout)
- * @returns {{postFromPage, popPosted, chrome, sandbox, stop}}
+ * @param {boolean} [opts.hidden] - initial document.hidden value (default false)
+ * @returns {{postFromPage, popPosted, chrome, sandbox, stop, setHidden, liveIntervals}}
  */
 export function loadContent(chromeOverrides = {}, opts = {}) {
   const pageListeners = []; // window.addEventListener('message', fn)
@@ -45,6 +46,25 @@ export function loadContent(chromeOverrides = {}, opts = {}) {
       posted.push(data);
     },
   };
+
+  const visibilityListeners = []; // document.addEventListener('visibilitychange', fn)
+  const fakeDocument = {
+    hidden: opts.hidden ?? false,
+    addEventListener(type, fn) {
+      if (type === 'visibilitychange') visibilityListeners.push(fn);
+    },
+    removeEventListener(type, fn) {
+      if (type !== 'visibilitychange') return;
+      const idx = visibilityListeners.indexOf(fn);
+      if (idx !== -1) visibilityListeners.splice(idx, 1);
+    },
+  };
+
+  /** Simulate the tab being hidden or shown (document.visibilityState changing). */
+  function setHidden(hidden) {
+    fakeDocument.hidden = hidden;
+    for (const fn of visibilityListeners) fn();
+  }
 
   const defaultRuntime = {
     id: 'fake-extension-id',
@@ -71,6 +91,7 @@ export function loadContent(chromeOverrides = {}, opts = {}) {
 
   const sandbox = {
     window: fakeWindow,
+    document: fakeDocument,
     chrome: chromeStub,
     console,
     location: { href: 'https://example.com/workspace' },
@@ -111,5 +132,5 @@ export function loadContent(chromeOverrides = {}, opts = {}) {
     liveIntervals.clear();
   }
 
-  return { postFromPage, postFromOtherWindow, pushFromBackground, popPosted, stop, chrome: chromeStub, sandbox, MARKER };
+  return { postFromPage, postFromOtherWindow, pushFromBackground, popPosted, stop, setHidden, liveIntervals, chrome: chromeStub, sandbox, MARKER };
 }

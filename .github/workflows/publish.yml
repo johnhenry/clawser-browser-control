@@ -32,8 +32,25 @@ jobs:
           refresh-token: ${{ secrets.CWS_REFRESH_TOKEN }}
           publish: true
 
+      - name: Build Firefox extension zip
+        # Same file list as the Chrome zip, but with firefox/manifest.json
+        # swapped in at the zip root (extension manifests must be at the
+        # archive root). No AMO auto-publish step yet — that needs Mozilla
+        # Add-ons API credentials (JWT issuer/secret) this repo doesn't have
+        # configured. This just attaches an installable, signed-by-nobody
+        # zip to the GitHub Release; manual AMO submission still required
+        # until those credentials exist. See #14 item 4.
+        run: |
+          mkdir -p dist/firefox-stage
+          grep -v '^manifest\.json$' scripts/dist-files.txt > /tmp/firefox-dist-files.txt
+          cp -r $(cat /tmp/firefox-dist-files.txt) dist/firefox-stage/
+          cp firefox/manifest.json dist/firefox-stage/manifest.json
+          (cd dist/firefox-stage && zip -r ../clawser-browser-control-firefox.zip . -x "*.DS_Store")
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/clawser-browser-control.zip
+          files: |
+            dist/clawser-browser-control.zip
+            dist/clawser-browser-control-firefox.zip
           generate_release_notes: true
