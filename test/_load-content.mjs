@@ -30,6 +30,10 @@ const MARKER = '__clawser_ext__';
  *   timeout path without a real 35s wait — no interaction with the presence
  *   heartbeat, which uses setInterval, not setTimeout)
  * @param {boolean} [opts.hidden] - initial document.hidden value (default false)
+ * @param {object} [opts.location] - overrides the sandbox's `location`
+ *   (default `{ href: 'http://localhost/workspace' }` — inside content.js's
+ *   own allowed origin scope, so existing relay tests don't need to know
+ *   about the origin allowlist to keep working)
  * @returns {{postFromPage, popPosted, chrome, sandbox, stop, setHidden, liveIntervals}}
  */
 export function loadContent(chromeOverrides = {}, opts = {}) {
@@ -94,7 +98,7 @@ export function loadContent(chromeOverrides = {}, opts = {}) {
     document: fakeDocument,
     chrome: chromeStub,
     console,
-    location: { href: 'https://example.com/workspace' },
+    location: opts.location || { href: 'http://localhost/workspace', protocol: 'http:', hostname: 'localhost' },
     setTimeout: opts.setTimeoutImpl || setTimeout,
     clearTimeout,
     setInterval: trackedSetInterval,

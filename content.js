@@ -20,6 +20,25 @@ function isRuntimeAlive() {
   return !!(typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id);
 }
 
+// Defense in depth: the manifest's content_scripts/web_accessible_resources
+// match patterns already restrict where content.js and pod-inject.js get
+// injected to localhost / 127.0.0.1 / file:// (Clawser's own app — see the
+// file header comment above), but this relay is the actual boundary between
+// an untrusted page and the extension's privileged background context. Check
+// the origin here too, so that if the manifest match pattern is ever
+// loosened again in the future (e.g. back to <all_urls>) without this check
+// being revisited, arbitrary web pages still can't relay messages through to
+// background.js.
+function isAllowedOrigin() {
+  try {
+    const { protocol, hostname } = location;
+    if (protocol === 'file:') return true;
+    return hostname === 'localhost' || hostname === '127.0.0.1';
+  } catch {
+    return false;
+  }
+}
+
 /** Query the background for which Chrome APIs are actually available. */
 async function queryCapabilities() {
   if (!isRuntimeAlive()) return null; // signal: extension gone
@@ -119,6 +138,11 @@ window.addEventListener('message', async (ev) => {
   if (ev.source !== window) return;
   const msg = ev.data;
   if (!msg || msg.type !== MARKER) return;
+
+  // Reject relaying anything into the extension's privileged background
+  // context from a page outside the intended localhost/127.0.0.1/file://
+  // scope — see isAllowedOrigin() above.
+  if (!isAllowedOrigin()) return;
 
   // Fire-and-forget notifications from the page (e.g. "this workspace is
   // ready" or "here's the result of a routine you asked me to run") — no

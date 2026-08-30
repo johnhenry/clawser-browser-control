@@ -938,7 +938,37 @@ class InjectedPod extends Pod {
 }
 
 // ── Boot ──
-const pod = new InjectedPod();
+// Relay page-originated Pod messages (peer/BroadcastChannel traffic) up
+// through content.js's existing page -> background relay: content.js
+// (isolated world, has chrome.runtime access) already listens for
+// window.postMessage'd { type: MARKER, direction: 'notify', ... } envelopes
+// from the page and forwards them to background.js via chrome.runtime —
+// see content.js's window.addEventListener('message', ...) handler. This
+// bridge reuses that exact channel rather than inventing a new one; this
+// script runs as a MAIN-world content script, so it has no chrome.* API
+// access of its own and must go through content.js regardless.
+//
+// content.js enforces its own localhost/127.0.0.1/file:// origin allowlist
+// before relaying anything to background.js (defense in depth alongside the
+// manifest's content_scripts/web_accessible_resources match patterns), so
+// this bridge does no origin filtering itself — content.js is the trust
+// boundary for what reaches the extension's privileged background context.
+const extensionBridge = {
+  postMessage(msg) {
+    try {
+      globalThis.postMessage({
+        type: '__clawser_ext__',
+        direction: 'notify',
+        action: 'pod_message',
+        params: { msg },
+      }, '*');
+    } catch {
+      // No content.js listening here (extension not installed, or this
+      // page is outside its match pattern) — nothing to relay to.
+    }
+  },
+};
+const pod = new InjectedPod({ extensionBridge });
 pod.boot({ discoveryTimeout: 2000 }).then(() => {
   console.log('[pod-inject] Pod ready:', pod.podId);
 }).catch((err) => {

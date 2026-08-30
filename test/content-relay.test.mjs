@@ -132,6 +132,62 @@ describe('content.js — page → background relay', () => {
   });
 });
 
+describe('content.js — origin allowlist (defense in depth)', () => {
+  const ALLOWED_LOCATIONS = [
+    { href: 'http://localhost:5173/workspace', protocol: 'http:', hostname: 'localhost' },
+    { href: 'https://localhost/workspace', protocol: 'https:', hostname: 'localhost' },
+    { href: 'http://127.0.0.1:8080/workspace', protocol: 'http:', hostname: '127.0.0.1' },
+    { href: 'https://127.0.0.1/workspace', protocol: 'https:', hostname: '127.0.0.1' },
+    { href: 'file:///Users/x/clawser/index.html', protocol: 'file:', hostname: '' },
+  ];
+
+  const BLOCKED_LOCATIONS = [
+    { href: 'https://example.com/workspace', protocol: 'https:', hostname: 'example.com' },
+    { href: 'https://clawser.erisera.com/', protocol: 'https:', hostname: 'clawser.erisera.com' },
+    { href: 'https://evil.localhost.attacker.com/', protocol: 'https:', hostname: 'evil.localhost.attacker.com' },
+    { href: 'https://localhost.attacker.com/', protocol: 'https:', hostname: 'localhost.attacker.com' },
+  ];
+
+  for (const location of ALLOWED_LOCATIONS) {
+    it(`relays requests from an allowed origin (${location.href})`, async (t) => {
+      const { postFromPage, popPosted, chrome } = await freshLoad(t, {}, { location });
+      chrome.runtime.sendMessage = async () => ({ result: 1 });
+
+      postFromPage({ type: MARKER, direction: 'request', id: 1, action: 'ping' });
+      await tick();
+
+      const [response] = popPosted().filter((m) => m.direction === 'response');
+      assert.equal(response.id, 1);
+      assert.deepEqual(response.result, 1);
+    });
+  }
+
+  for (const location of BLOCKED_LOCATIONS) {
+    it(`does not relay requests from a disallowed origin (${location.href})`, async (t) => {
+      const { postFromPage, popPosted, chrome } = await freshLoad(t, {}, { location });
+      let called = false;
+      chrome.runtime.sendMessage = async () => { called = true; return { result: 1 }; };
+
+      postFromPage({ type: MARKER, direction: 'request', id: 2, action: 'ping' });
+      await tick();
+
+      assert.equal(called, false);
+      assert.deepEqual(popPosted().filter((m) => m.direction === 'response'), []);
+    });
+
+    it(`does not relay notifications from a disallowed origin (${location.href})`, async (t) => {
+      const { postFromPage, chrome } = await freshLoad(t, {}, { location });
+      let called = false;
+      chrome.runtime.sendMessage = async () => { called = true; return {}; };
+
+      postFromPage({ type: MARKER, direction: 'notify', action: 'workspace_ready', wsId: 'ws1' });
+      await tick();
+
+      assert.equal(called, false);
+    });
+  }
+});
+
 describe('content.js — background → page relay (push)', () => {
   it('relays a push message from the background down to the page unmodified', async (t) => {
     const { pushFromBackground, popPosted } = await freshLoad(t);
