@@ -1348,6 +1348,19 @@ function handleNotify(msg, sender) {
       clearTimeout(pending.timer);
       pending.resolve({ success: !!msg.success, error: msg.error || null });
     }
+  } else if (msg.action === 'pod_message') {
+    // Relayed via pod-inject.js's extensionBridge (InjectedPod running in
+    // the page's MAIN world) -> content.js -> here. content.js has already
+    // enforced the localhost/127.0.0.1/file:// origin allowlist before this
+    // ever reaches the background context (see content.js isAllowedOrigin()).
+    recordAudit({
+      timestamp: Date.now(),
+      action: 'pod_message',
+      tabId: tabId ?? null,
+      url: tabUrl ?? null,
+      success: true,
+      error: null,
+    });
   }
 }
 

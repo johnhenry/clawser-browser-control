@@ -81,4 +81,18 @@ describe('audit log', () => {
     // Only the "audit_log(clear:true)" and "audit_log()" calls themselves remain.
     assert.equal(second.result.entries.length, 1);
   });
+
+  it('records a pod_message notification relayed from pod-inject.js\'s extensionBridge', async () => {
+    const { notify, send } = loadBackground();
+    notify('pod_message', { params: { msg: { type: 'pod:message', from: 'pod-1', data: 'hello' } } }, {
+      tab: { id: 9, url: 'http://localhost:5173/workspace' },
+    });
+
+    const { result } = await send('audit_log', {});
+    const entry = result.entries.find((e) => e.action === 'pod_message');
+    assert.ok(entry, 'expected a pod_message entry in the audit log');
+    assert.equal(entry.tabId, 9);
+    assert.equal(entry.url, 'http://localhost:5173/workspace');
+    assert.equal(entry.success, true);
+  });
 });
