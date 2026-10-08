@@ -233,7 +233,10 @@ async function executeInTab(tabId, func, args = []) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func,
-    args,
+    // chrome.scripting.executeScript rejects `undefined` in args ("Value is unserializable"),
+    // and callers pass optional fields straight through (a click by selector has no text/x/y).
+    // Send null; in-page functions test optional args with `!= null`, never `!== undefined`.
+    args: args.map((a) => (a === undefined ? null : a)),
     world: 'MAIN',
   });
   if (!results || results.length === 0) return null;
@@ -611,7 +614,7 @@ async function actionClick({ tabId, selector, text, x, y }) {
   const tid = await resolveTabId({ tabId });
   return executeInTab(tid, (sel, txt, cx, cy) => {
     let el;
-    if (cx !== undefined && cy !== undefined) el = document.elementFromPoint(cx, cy);
+    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
     else if (sel) el = document.querySelector(sel);
     else if (txt) {
       const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
@@ -634,7 +637,7 @@ async function actionDoubleClick({ tabId, selector, text, x, y }) {
   const tid = await resolveTabId({ tabId });
   return executeInTab(tid, (sel, txt, cx, cy) => {
     let el;
-    if (cx !== undefined && cy !== undefined) el = document.elementFromPoint(cx, cy);
+    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
     else if (sel) el = document.querySelector(sel);
     else if (txt) {
       const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
@@ -657,7 +660,7 @@ async function actionTripleClick({ tabId, selector, text, x, y }) {
   const tid = await resolveTabId({ tabId });
   return executeInTab(tid, (sel, txt, cx, cy) => {
     let el;
-    if (cx !== undefined && cy !== undefined) el = document.elementFromPoint(cx, cy);
+    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
     else if (sel) el = document.querySelector(sel);
     else if (txt) {
       const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
@@ -685,7 +688,7 @@ async function actionRightClick({ tabId, selector, text, x, y }) {
   const tid = await resolveTabId({ tabId });
   return executeInTab(tid, (sel, txt, cx, cy) => {
     let el;
-    if (cx !== undefined && cy !== undefined) el = document.elementFromPoint(cx, cy);
+    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
     else if (sel) el = document.querySelector(sel);
     else if (txt) {
       const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
@@ -708,7 +711,7 @@ async function actionHover({ tabId, selector, text, x, y }) {
   const tid = await resolveTabId({ tabId });
   return executeInTab(tid, (sel, txt, cx, cy) => {
     let el;
-    if (cx !== undefined && cy !== undefined) el = document.elementFromPoint(cx, cy);
+    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
     else if (sel) el = document.querySelector(sel);
     else if (txt) {
       const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
@@ -740,7 +743,7 @@ async function actionDrag({ tabId, startSelector, startX, startY, endX, endY }) 
   return executeInTab(tid, (sel, sx, sy, ex, ey) => {
     let el;
     if (sel) el = document.querySelector(sel);
-    else if (sx !== undefined && sy !== undefined) el = document.elementFromPoint(sx, sy);
+    else if (sx != null && sy != null) el = document.elementFromPoint(sx, sy);
     if (!el) return { error: 'Element not found' };
     el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: sx || 0, clientY: sy || 0 }));
     el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: ex, clientY: ey }));
@@ -850,7 +853,7 @@ async function actionSelectOption({ tabId, selector, value, text }) {
     if (!el || el.tagName !== 'SELECT') return { error: 'Select element not found' };
     // value takes precedence over text if both are given, rather than
     // whichever matches first across the option list.
-    const matches = (opt) => (val !== undefined ? opt.value === val : opt.textContent?.trim() === txt);
+    const matches = (opt) => (val != null ? opt.value === val : opt.textContent?.trim() === txt);
     for (const opt of el.options) {
       if (matches(opt)) {
         opt.selected = true;
