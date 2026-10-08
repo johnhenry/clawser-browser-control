@@ -200,6 +200,8 @@ async function handleAction(action, params) {
 
     // ── WebMCP ──
     case 'webmcp_discover': return actionWebmcpDiscover(params);
+    case 'webmcp_list_tools': return actionWebmcpListTools(params);
+    case 'webmcp_call_tool': return actionWebmcpCallTool(params);
 
     // ── CORS-free fetch ──
     case 'cors_fetch': return actionCorsFetch(params);
@@ -299,6 +301,8 @@ function getAvailableCapabilities() {
   if (typeof chrome !== 'undefined' && chrome.cookies) caps.push('cookies');
   if (typeof chrome !== 'undefined' && chrome.webRequest) caps.push('network');
   caps.push('cors_fetch');
+  // WebMCP tools exposed by other open tabs (document.modelContext), read and called on demand.
+  if (typeof chrome !== 'undefined' && chrome.scripting && chrome.tabs) caps.push('webmcp_tabs');
   return caps;
 }
 
@@ -325,6 +329,7 @@ function actionCapabilities() {
     { name: 'evaluate', available: true },
     { name: 'console', available: true },
     { name: 'webmcp', available: true },
+    { name: 'webmcp_tabs', available: !!(chrome.scripting && chrome.tabs), note: 'list and call document.modelContext tools of other open tabs, on demand' },
     { name: 'cors_fetch', available: true },
   ];
   return { capabilities: caps, userScriptsAvailable };
@@ -1107,6 +1112,173 @@ async function actionWebmcpDiscover({ tabId }) {
   }
 
   return pageResult;
+}
+
+// -- WebMCP tools in other tabs --
+//
+// A page that implements WebMCP registers tools on `document.modelContext`.
+// Nothing here runs on every page: a function is injected into the MAIN world of
+// a tab only when Clawser asks to list or call that tab's tools, so the page's
+// own `document.modelContext` (and not an isolated-world copy) is what is read.
+// Everything the page returns is untrusted data and is clamped here.
+//
+// Reading shapes handled (Chrome's native API and the @mcp-b/global polyfill):
+//   document.modelContext.getTools()                    -> RegisteredTool[]   (inputSchema: object | JSON string)
+//   document.modelContext.executeTool(tool, jsonString) -> Promise<string|null>
+//   navigator.modelContextTesting.listTools() / .executeTool(name, jsonString)   (older Chrome previews)
+
+const WEBMCP_LIMITS = {
+  maxTabs: 50,
+  maxTools: 100,
+  maxText: 2000,
+  maxSchemaChars: 20000,
+  maxArgsChars: 100000,
+  maxResultChars: 100000,
+  callTimeoutMs: 30000,
+};
+
+function isWebPage(url) {
+  try {
+    const p = new URL(url).protocol;
+    return p === 'http:' || p === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/** Runs IN THE PAGE (serialized by executeScript): must not reference anything outside itself. */
+async function pageListWebmcpTools(limits) {
+  const clip = (s, n) => (typeof s === 'string' && s.length > n ? s.slice(0, n) : s);
+  const toSchema = (s) => {
+    let v = s;
+    if (typeof v === 'string') { try { v = JSON.parse(v); } catch { v = null; } }
+    if (!v || typeof v !== 'object') return { type: 'object', properties: {} };
+    if (JSON.stringify(v).length > limits.maxSchemaChars) return { type: 'object', properties: {}, 'x-truncated': true };
+    return v;
+  };
+  const mc = typeof document !== 'undefined' ? document.modelContext : undefined;
+  const testing = typeof navigator !== 'undefined' ? navigator.modelContextTesting : undefined;
+  let api = null;
+  let raw = [];
+  if (mc && typeof mc.getTools === 'function') {
+    api = 'document.modelContext';
+    raw = await mc.getTools();
+  } else if (testing && typeof testing.listTools === 'function') {
+    api = 'navigator.modelContextTesting';
+    raw = testing.listTools();
+  }
+  if (!api) return { api: null, tools: [] };
+  const tools = [];
+  for (const t of Array.from(raw || []).slice(0, limits.maxTools)) {
+    if (!t || typeof t.name !== 'string' || !t.name) continue;
+    const tool = {
+      name: clip(t.name, 128),
+      title: clip(typeof t.title === 'string' ? t.title : '', 200),
+      description: clip(typeof t.description === 'string' ? t.description : '', limits.maxText),
+      inputSchema: toSchema(t.inputSchema),
+    };
+    // Only the cautious hint is forwarded: a page's claim that a tool is read-only is not evidence.
+    if (t.annotations && t.annotations.destructiveHint === true) tool.annotations = { destructiveHint: true };
+    tools.push(tool);
+  }
+  return { api, tools };
+}
+
+/** Runs IN THE PAGE. Returns { ok, text, truncated } or { ok: false, error }. */
+async function pageCallWebmcpTool(name, argsJson, timeoutMs, maxChars) {
+  const mc = typeof document !== 'undefined' ? document.modelContext : undefined;
+  const testing = typeof navigator !== 'undefined' ? navigator.modelContextTesting : undefined;
+  const run = async () => {
+    if (mc && typeof mc.getTools === 'function') {
+      const tool = (await mc.getTools()).find((t) => t && t.name === name);
+      if (!tool) throw new Error('No WebMCP tool named "' + name + '" on this page');
+      if (typeof mc.executeTool === 'function') return mc.executeTool(tool, argsJson);
+      if (typeof tool.execute === 'function') return tool.execute(JSON.parse(argsJson));
+      throw new Error('This page does not let its WebMCP tools be executed from outside');
+    }
+    if (testing && typeof testing.executeTool === 'function') return testing.executeTool(name, argsJson);
+    throw new Error('This page exposes no WebMCP API');
+  };
+  let timer;
+  try {
+    const raw = await Promise.race([
+      run(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('WebMCP tool timed out after ' + timeoutMs + ' ms')), timeoutMs); }),
+    ]);
+    let text = typeof raw === 'string' ? raw : JSON.stringify(raw === undefined ? null : raw);
+    if (typeof text !== 'string') text = String(raw);
+    const truncated = text.length > maxChars;
+    return { ok: true, text: truncated ? text.slice(0, maxChars) : text, truncated };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * List the WebMCP tools of one tab (`tabId`) or of every open http(s) tab.
+ * @returns {Promise<{ pages: Array<{ tabId: number, url: string, origin: string, title: string, api: string, tools: object[] }>, skipped: number }>}
+ */
+async function actionWebmcpListTools({ tabId } = {}) {
+  let tabs;
+  if (tabId !== undefined && tabId !== null) {
+    const tab = await chrome.tabs.get(tabId);
+    if (!isWebPage(tab.url)) throw new Error('WebMCP tools can only be read from http(s) pages');
+    tabs = [tab];
+  } else {
+    tabs = (await chrome.tabs.query({})).filter((t) => t.id !== undefined && isWebPage(t.url)).slice(0, WEBMCP_LIMITS.maxTabs);
+  }
+  let skipped = 0;
+  const pages = [];
+  await Promise.all(tabs.map(async (tab) => {
+    try {
+      const found = await executeInTab(tab.id, pageListWebmcpTools, [WEBMCP_LIMITS]);
+      if (found && found.api && found.tools.length) {
+        pages.push({ tabId: tab.id, url: tab.url, origin: new URL(tab.url).origin, title: tab.title || '', api: found.api, tools: found.tools });
+      }
+    } catch {
+      skipped++; // restricted page (chrome web store, devtools), discarded tab, or mid-navigation
+    }
+  }));
+  pages.sort((a, b) => a.tabId - b.tabId);
+  return { pages, skipped };
+}
+
+/**
+ * Call one WebMCP tool in one tab. `expectedOrigin` is required: the caller listed
+ * the tool on that origin, and a tab that has since navigated elsewhere must not
+ * receive the call.
+ */
+async function actionWebmcpCallTool({ tabId, name, arguments: args, expectedOrigin, timeoutMs } = {}) {
+  if (tabId === undefined || tabId === null) throw new Error('tabId is required');
+  if (typeof name !== 'string' || !name) throw new Error('name is required');
+  if (typeof expectedOrigin !== 'string' || !expectedOrigin) throw new Error('expectedOrigin is required');
+  const argsJson = JSON.stringify(args === undefined ? {} : args);
+  if (argsJson.length > WEBMCP_LIMITS.maxArgsChars) throw new Error('arguments are too large');
+  const budget = Math.min(Math.max(Number(timeoutMs) || WEBMCP_LIMITS.callTimeoutMs, 1000), WEBMCP_LIMITS.callTimeoutMs);
+
+  const startedAt = Date.now();
+  const tab = await chrome.tabs.get(tabId);
+  let origin = null;
+  let outcome = { success: false, error: null };
+  try {
+    if (!isWebPage(tab.url)) throw new Error('WebMCP tools can only be called on http(s) pages');
+    origin = new URL(tab.url).origin;
+    if (origin !== expectedOrigin) throw new Error(`Tab ${tabId} is now on ${origin}, not ${expectedOrigin}; list its tools again`);
+    const res = await executeInTab(tabId, pageCallWebmcpTool, [name, argsJson, budget, WEBMCP_LIMITS.maxResultChars]);
+    if (!res) throw new Error('The page did not answer');
+    if (!res.ok) throw new Error(res.error);
+    outcome = { success: true, error: null };
+    return { tabId, origin, name, text: res.text, truncated: res.truncated };
+  } catch (e) {
+    outcome = { success: false, error: e.message || String(e) };
+    throw e;
+  } finally {
+    // The router's own entry says who asked; this one says which tool ran, on which origin.
+    // Arguments and results are never logged.
+    recordAudit({ timestamp: startedAt, action: 'webmcp_call_tool', tabId, url: origin || tab.url || null, tool: name, success: outcome.success, error: outcome.error });
+  }
 }
 
 // ── Tab Watch ─────────────────────────────────────────────────────

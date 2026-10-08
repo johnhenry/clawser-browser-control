@@ -1,6 +1,6 @@
 # Clawser Browser Control — Privacy Policy
 
-**Last updated:** March 13, 2026
+**Last updated:** October 8, 2026
 
 ## Overview
 
@@ -26,6 +26,7 @@ The extension requires browser permissions to provide its functionality. When ac
 - **Screenshots** — to capture visible page content for the agent
 - **Cookies** — to relay authentication state to the agent when requested
 - **Network requests** — to monitor page network activity when requested
+- **WebMCP tools** — the names, descriptions and schemas of tools a web page registers on `document.modelContext`, and the result of a tool call, only when the local Clawser workspace asks for them
 
 All accessed data is processed locally and communicated only to the Clawser workspace running on your local machine (localhost).
 
