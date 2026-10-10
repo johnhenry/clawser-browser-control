@@ -10,9 +10,9 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -54,6 +54,11 @@ jobs:
           test -f gifenc.js || (echo "Missing gifenc.js" && exit 1)
           test -f offscreen.html || (echo "Missing offscreen.html" && exit 1)
           test -f offscreen.js || (echo "Missing offscreen.js" && exit 1)
+          test -f sidepanel.html || (echo "Missing sidepanel.html" && exit 1)
+          test -f sidepanel.js || (echo "Missing sidepanel.js" && exit 1)
+          test -f sidepanel.css || (echo "Missing sidepanel.css" && exit 1)
+          test -f options.html || (echo "Missing options.html" && exit 1)
+          test -f options.js || (echo "Missing options.js" && exit 1)
           test -f icons/icon-16.png || (echo "Missing icon-16" && exit 1)
           test -f icons/icon-48.png || (echo "Missing icon-48" && exit 1)
           test -f icons/icon-128.png || (echo "Missing icon-128" && exit 1)

@@ -43,9 +43,8 @@ describe('manifests', () => {
     assert.deepEqual([...chromeManifest.permissions].sort(), [...base, 'sidePanel', 'contextMenus'].sort());
     assert.deepEqual(chromeManifest.host_permissions, ['<all_urls>']);
   });
-  it('version is untouched (owner releases)', () => {
-    assert.equal(chromeManifest.version, '0.1.1');
-    assert.equal(firefoxManifest.version, '0.1.1');
+  it('Chrome and Firefox manifests carry the same version', () => {
+    assert.equal(firefoxManifest.version, chromeManifest.version);
   });
   it('declares no extension CSP loosening', () => {
     assert.equal(chromeManifest.content_security_policy, undefined);

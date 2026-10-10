@@ -86,6 +86,12 @@ gh secret set CWS_CLIENT_SECRET --repo johnhenry/clawser-browser-control --body 
 gh secret set CWS_REFRESH_TOKEN --repo johnhenry/clawser-browser-control --body "$CWS_REFRESH_TOKEN"
 ```
 
+The upload uses Chrome Web Store API v2, which also needs your publisher ID (Developer Dashboard → Publisher → Settings). It is not secret, so it is a repository variable:
+
+```bash
+gh variable set CWS_PUBLISHER_ID --repo johnhenry/clawser-browser-control --body "<publisher id>"
+```
+
 ### Releasing a new version
 
 1. Bump the version in **both** `manifest.json` and `firefox/manifest.json` — keep them in sync
@@ -93,12 +99,13 @@ gh secret set CWS_REFRESH_TOKEN --repo johnhenry/clawser-browser-control --body 
 
 ```bash
 git add manifest.json firefox/manifest.json
-git commit -m "release: v0.1.1"
-git tag v0.1.1
+git commit -m "release: v0.2.0"
+git tag v0.2.0
 git push origin main --tags
 ```
 
 3. GitHub Actions will:
+   - Stop if the tag does not match the version in both manifests
    - Build a zip (excluding store assets, tests, etc.)
    - Upload to Chrome Web Store and publish
    - Create a GitHub Release with the zip attached
