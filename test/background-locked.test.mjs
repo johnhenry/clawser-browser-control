@@ -105,6 +105,29 @@ describe('a background tab that stops at the vault prompt', () => {
   });
 });
 
+describe('replies from a locked page (locked:true is set on every reply from the locked runner)', () => {
+  it('a successful monitor check is "executed", not "not run"', async () => {
+    const { b } = boot({ execReply: () => ({ success: true, error: null, locked: true }) });
+    await b.fireAlarm();
+    assert.equal(lastResult(b), 'executed');
+    assert.equal((await status(b)).lockedSkipped, false);
+  });
+
+  it('a monitor check that threw keeps its own error and does not claim the tab was locked', async () => {
+    const { b } = boot({ execReply: () => ({ success: false, error: 'readSource exploded', locked: true }) });
+    await b.fireAlarm();
+    assert.equal(lastResult(b), 'skipped: readSource exploded');
+    assert.equal((await status(b)).lockedSkipped, false);
+  });
+
+  it('only the refusal {error:"locked"} counts as a locked skip', async () => {
+    const { b } = boot({ actionType: 'prompt', ready: {}, execReply: () => ({ success: false, error: 'locked', locked: true }) });
+    await b.fireAlarm();
+    assert.equal(lastResult(b), 'not run: Clawser is locked');
+    assert.equal((await status(b)).lockedSkipped, true);
+  });
+});
+
 describe('the user already has a locked clawser tab', () => {
   it('a monitor is run in it (it advertises btask_monitor) and nothing is opened', async () => {
     const { b, created, executed } = boot({ openTabs: [mine(11)], pong: pongOf({ 11: LOCKED_READY }) });

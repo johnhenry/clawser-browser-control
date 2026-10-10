@@ -2006,8 +2006,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     for (const r of due) {
       const res = await delegateRoutineExecution(r.id, routineTimeoutMs(r), isMonitorRoutine(r));
       const { success, error } = res;
-      const lastResult = success ? 'executed' : (res.locked ? 'not run: Clawser is locked' : `skipped: ${error}`);
-      if (res.locked && !isMonitorRoutine(r)) await setLockedSkip(true);
+      // The locked runner marks every reply locked:true; only its refusal ('locked') or our own
+      // pre-check means "not run because locked". A real error keeps its message.
+      const refused = !success && res.locked === true && (error === 'locked' || error === lockedResult().error);
+      const lastResult = success ? 'executed' : (refused ? 'not run: Clawser is locked' : `skipped: ${error}`);
+      if (refused && !isMonitorRoutine(r)) await setLockedSkip(true);
       else if (success && !isMonitorRoutine(r)) await setLockedSkip(false);
       ran.push({
         id: r.id,
