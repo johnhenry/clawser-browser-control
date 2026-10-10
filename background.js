@@ -1510,7 +1510,7 @@ const ROUTINE_EXEC_TIMEOUT_MS = 30000;
 const MONITOR_EXEC_TIMEOUT_MS = 120000;
 
 function routineTimeoutMs(routine) {
-  return routine?.action?.type === 'btask_monitor' ? MONITOR_EXEC_TIMEOUT_MS : ROUTINE_EXEC_TIMEOUT_MS;
+  return (routine?.action?.type === 'btask_monitor' || routine?.actionType === 'btask_monitor') ? MONITOR_EXEC_TIMEOUT_MS : ROUTINE_EXEC_TIMEOUT_MS;
 }
 const TAB_OPEN_WAIT_MS = 20000;
 
@@ -1530,6 +1530,147 @@ const schedulerOwnedTabs = new Set();
 /** True while an alarm is processing due routines, so a slow run is not
  * started a second time by the next minute's alarm. */
 let schedulerBusy = false;
+
+// ── Workspace reference (survives service-worker restarts) ────────
+//
+// lastKnownWorkspaceTab alone lives in memory and is lost when the worker is
+// killed. {wsId, url, lastSeen} is mirrored to chrome.storage.local so a cold
+// start can still open the workspace in a background tab.
+
+const WORKSPACE_REF_KEY = 'workspaceRef';
+
+/** Remember the live workspace tab (memory now, storage.local best-effort) if its origin is allowed. */
+function rememberWorkspace({ tabId, url, wsId }) {
+  const lastSeen = Date.now();
+  lastKnownWorkspaceTab = { tabId, url, wsId, lastSeen };
+  persistWorkspaceRef({ wsId, url, lastSeen }).catch(() => {});
+}
+
+async function persistWorkspaceRef(ref) {
+  if (!isClawserUrl(ref.url, await getCustomOrigin())) return;
+  await chrome.storage.local.set({ [WORKSPACE_REF_KEY]: ref });
+}
+
+/** Load the persisted reference once at worker start; a live message that arrived first wins. */
+async function loadWorkspaceRef() {
+  try {
+    const stored = (await chrome.storage.local.get(WORKSPACE_REF_KEY))?.[WORKSPACE_REF_KEY];
+    if (!stored || typeof stored !== 'object') return;
+    const { wsId, url, lastSeen } = stored;
+    if (wsId !== null && (typeof wsId !== 'string' || wsId.length > 100)) return;
+    if (typeof url !== 'string' || url.length > BTASK_MAX_URL) return;
+    if (!isClawserUrl(url, await getCustomOrigin())) return; // origin no longer allowed: do not open it
+    if (!lastKnownWorkspaceTab) {
+      lastKnownWorkspaceTab = { tabId: -1, url, wsId, lastSeen: Number.isFinite(lastSeen) ? lastSeen : 0 };
+    }
+  } catch { /* storage unavailable: behave as a fresh start */ }
+}
+
+const workspaceRefLoaded = loadWorkspaceRef();
+
+// ── Routine sync from the page ────────────────────────────────────
+//
+// The page and the extension have separate IndexedDB stores (different
+// origins), so the page pushes its schedulable routines here. The extension
+// never receives an action payload: it only learns when each routine is due
+// and asks the page to run it by id.
+
+const SYNC_MAX_ROUTINES = 500;
+const SYNC_MAX_NAME = 200;
+const SYNC_MIN_INTERVAL_MS = 60000;
+const SYNC_MAX_INTERVAL_MS = 366 * 24 * 3600 * 1000;
+const SYNC_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
+
+function sanitizeSyncedTrigger(t) {
+  if (!t || typeof t !== 'object') return null;
+  if (t.type === 'cron') {
+    return typeof t.cron === 'string' && validateCronExpressionInline(t.cron) ? { type: 'cron', cron: t.cron.trim() } : null;
+  }
+  if (t.type === 'interval') {
+    if (typeof t.intervalMs !== 'number' || !Number.isFinite(t.intervalMs)) return null;
+    return { type: 'interval', intervalMs: Math.min(Math.max(Math.floor(t.intervalMs), SYNC_MIN_INTERVAL_MS), SYNC_MAX_INTERVAL_MS) };
+  }
+  if (t.type === 'once') {
+    const at = typeof t.at === 'number' ? t.at : (typeof t.at === 'string' ? Date.parse(t.at) : NaN);
+    return Number.isFinite(at) && at > 0 ? { type: 'once', at: Math.floor(at) } : null;
+  }
+  return null;
+}
+
+function sanitizeSyncedRoutines(list, wsId) {
+  const out = [];
+  const seen = new Set();
+  for (const r of Array.isArray(list) ? list : []) {
+    if (out.length >= SYNC_MAX_ROUTINES) break;
+    if (!r || typeof r !== 'object' || typeof r.id !== 'string' || !SYNC_ID_RE.test(r.id) || seen.has(r.id)) continue;
+    const trigger = sanitizeSyncedTrigger(r.trigger);
+    if (!trigger) continue;
+    seen.add(r.id);
+    const actionType = clampText(typeof r.actionType === 'string' ? r.actionType : '', 40);
+    out.push({
+      id: r.id,
+      wsId,
+      name: clampText(typeof r.name === 'string' ? r.name : r.id, SYNC_MAX_NAME),
+      enabled: r.enabled === true,
+      trigger,
+      actionType,
+      action: { type: actionType }, // informational only; never an executable payload
+    });
+  }
+  return out;
+}
+
+async function handleRoutinesSync(msg, sender) {
+  const tabId = sender?.tab?.id;
+  const tabUrl = sender?.tab?.url;
+  if (tabId === undefined || typeof tabUrl !== 'string') return;
+  if (!isClawserUrl(tabUrl, await getCustomOrigin())) return;
+  const wsId = msg.wsId;
+  if (typeof wsId !== 'string' || wsId.length < 1 || wsId.length > 100) return;
+  if (!Array.isArray(msg.routines)) return;
+
+  rememberWorkspace({ tabId, url: tabUrl, wsId });
+  const incoming = sanitizeSyncedRoutines(msg.routines, wsId);
+  const now = Date.now();
+
+  const db = await new Promise((resolve, reject) => {
+    const req = indexedDB.open('clawser_checkpoints', 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains('checkpoints')) req.result.createObjectStore('checkpoints');
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  try {
+    // One readwrite transaction (get, then put): definitions come from the page, the
+    // extension's own bookkeeping is kept by id, ids missing from the sync are removed,
+    // and other workspaces' routines are left alone.
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('checkpoints', 'readwrite');
+      const store = tx.objectStore('checkpoints');
+      const get = store.get('background_routine_state');
+      get.onsuccess = () => {
+        const current = Array.isArray(get.result) ? get.result : [];
+        const previous = new Map(current.filter((r) => r && r.wsId === wsId).map((r) => [r.id, r]));
+        const others = current.filter((r) => !(r && r.wsId === wsId));
+        const mine = incoming.map((r) => {
+          const prev = previous.get(r.id);
+          r.state = prev?.state && typeof prev.state === 'object' ? prev.state : {};
+          r.meta = prev?.meta && typeof prev.meta === 'object' ? prev.meta : {};
+          if (r.trigger.type === 'interval' && r.meta.lastFired == null) r.meta.lastFired = now; // first check one interval from now
+          if (r.trigger.type === 'once' && prev && prev.trigger?.at !== r.trigger.at) delete r.meta.fired;
+          return r;
+        });
+        store.put([...others, ...mine], 'background_routine_state');
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
+    });
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
+}
 
 // Set up the alarm on extension install/update
 chrome.runtime.onInstalled.addListener(() => {
@@ -1554,10 +1695,12 @@ function handleNotify(msg, sender) {
 
   if (msg.action === 'workspace_ready') {
     if (tabId !== undefined && tabUrl) {
-      lastKnownWorkspaceTab = { tabId, url: tabUrl, wsId: msg.wsId || null, lastSeen: Date.now() };
+      rememberWorkspace({ tabId, url: tabUrl, wsId: msg.wsId || null });
       const waiter = pendingReadyWaiters.get(tabId);
       if (waiter) { pendingReadyWaiters.delete(tabId); waiter(); }
     }
+  } else if (msg.action === 'routines_sync') {
+    handleRoutinesSync(msg, sender).catch((e) => console.warn('[clawser-ext] routines_sync failed:', e));
   } else if (msg.action === 'routine_executed') {
     const pending = pendingRoutineExecutions.get(msg.routineId);
     if (pending) {
@@ -1607,7 +1750,7 @@ function requestRoutineExecution(tabId, routineId, timeoutMs = ROUTINE_EXEC_TIME
  * @returns {Promise<{success: boolean, error: string|null}>}
  */
 async function delegateRoutineExecution(routineId, timeoutMs = ROUTINE_EXEC_TIMEOUT_MS) {
-  if (lastKnownWorkspaceTab) {
+  if (lastKnownWorkspaceTab && lastKnownWorkspaceTab.tabId >= 0) {
     try {
       const tab = await chrome.tabs.get(lastKnownWorkspaceTab.tabId);
       if (tab && tab.url === lastKnownWorkspaceTab.url) {
@@ -1679,6 +1822,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== SCHEDULER_ALARM_NAME) return;
   if (schedulerBusy) return; // the previous alarm is still running its routines
   schedulerBusy = true;
+  await workspaceRefLoaded; // a cold-started worker must know the workspace before deciding what runs
 
   try {
     const DB_NAME = 'clawser_checkpoints';
@@ -1741,8 +1885,21 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // time (async, potentially slow if a tab needs to be opened) so we
     // don't race concurrent IDB writes against ourselves.
     const due = [];
+    const currentWsId = lastKnownWorkspaceTab?.wsId ?? null;
     for (const r of routines) {
       if (!r.enabled) continue;
+      // Routines synced from a page carry their wsId: run only the known workspace's.
+      // (Untagged routines predate the sync and run as before.)
+      if (r.wsId != null && r.wsId !== currentWsId) continue;
+
+      if (r.trigger?.type === 'interval' && Number.isFinite(r.trigger.intervalMs)) {
+        if (now >= (r.meta?.lastFired || 0) + r.trigger.intervalMs) due.push(r);
+        continue;
+      }
+      if (r.trigger?.type === 'once') {
+        if (!r.meta?.fired && Number.isFinite(r.trigger.at) && now >= r.trigger.at) due.push(r);
+        continue;
+      }
 
       if (r.trigger?.type === 'cron' && r.trigger?.cron) {
         if (!validateCronExpressionInline(r.trigger.cron)) {
@@ -1776,8 +1933,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         lastRun: Date.now(),
         lastResult,
         lastCronMinute: r.trigger?.type === 'cron' ? Math.floor(now / 60000) : null,
-        interval: r.meta?.scheduleType === 'interval',
-        once: r.meta?.scheduleType === 'once',
+        interval: r.meta?.scheduleType === 'interval' || r.trigger?.type === 'interval',
+        once: r.meta?.scheduleType === 'once' || r.trigger?.type === 'once',
       });
       results.push({ routineId: r.id, success, error });
       if (!success) console.warn(`[clawser-ext] Routine "${r.name || r.id}" not executed: ${error}`);

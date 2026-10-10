@@ -38,9 +38,50 @@ function shallowMergeOneLevel(base, override) {
  * @param {Function} [opts.fetchImpl] - stub for the global fetch() used by
  *   actionCorsFetch/actionWebmcpDiscover — defaults to one that rejects,
  *   since most tests shouldn't make real network calls.
+ * @param {Map} [opts.idbStore] - an existing extension IndexedDB store, to simulate a service-worker restart
+ * @param {object} [opts.storage] - initial chrome.storage.local contents (pass a previous instance's localStore for a restart)
  * @param {Function} [opts.setTimeoutImpl] - replaces the sandbox's setTimeout (e.g. to shrink retry delays)
  * @returns {{send: Function, notify: Function, fireAlarm: Function, chrome: object, sandbox: object}}
  */
+/** An independent in-memory IndexedDB (one store, get/put) with real-transaction completion semantics. */
+export function makeFakeIndexedDB(store = new Map()) {
+  const indexedDB = {
+    open() {
+      const req = {};
+      queueMicrotask(() => {
+        req.result = {
+          objectStoreNames: { contains: () => true },
+          close() {},
+          transaction: () => {
+            // Completes once every request issued so far (including ones issued from
+            // inside a success callback) has finished, like a real IDB transaction.
+            let pending = 0; let completeFn = null; let completed = false;
+            const maybeComplete = () => {
+              if (pending === 0 && completeFn && !completed) { completed = true; queueMicrotask(() => completeFn()); }
+            };
+            return {
+              objectStore: () => ({
+                get: (key) => {
+                  const r = {};
+                  pending++;
+                  queueMicrotask(() => { const v = store.get(key); r.result = v === undefined ? undefined : structuredClone(v); r.onsuccess?.(); pending--; maybeComplete(); });
+                  return r;
+                },
+                put: (data, key) => { store.set(key, structuredClone(data)); },
+              }),
+              get oncomplete() { return completeFn; },
+              set oncomplete(fn) { completeFn = fn; queueMicrotask(maybeComplete); },
+            };
+          },
+        };
+        req.onsuccess?.();
+      });
+      return req;
+    },
+  };
+  return { indexedDB, store };
+}
+
 export function loadBackground(chromeOverrides = {}, opts = {}) {
   const hooks = { listener: null, alarmListener: null, installedListener: null, startupListener: null, menuListener: null };
   const menusCreated = []; // chrome.contextMenus.create() props, in order
@@ -121,46 +162,16 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
 
   const chromeStub = shallowMergeOneLevel(defaultChrome, chromeOverrides);
 
-  // In-memory IndexedDB stub — real browsers have indexedDB, but a vm
-  // context (a fresh Node realm, not a browser) doesn't. background.js's
-  // scheduler is the only thing that touches it; `idbStore` is exposed
-  // so tests can seed/read routine state directly.
-  const idbStore = new Map();
-  const fakeIndexedDB = {
-    open() {
-      const req = {};
-      queueMicrotask(() => {
-        req.result = {
-          objectStoreNames: { contains: () => true },
-          close() {},
-          transaction: () => {
-            // Completes once every request issued so far (including ones issued from
-            // inside a success callback) has finished, like a real IDB transaction.
-            let pending = 0; let completeFn = null; let completed = false;
-            const maybeComplete = () => {
-              if (pending === 0 && completeFn && !completed) { completed = true; queueMicrotask(() => completeFn()); }
-            };
-            const tx = {
-              objectStore: () => ({
-                get: (key) => {
-                  const r = {};
-                  pending++;
-                  queueMicrotask(() => { const v = idbStore.get(key); r.result = v === undefined ? undefined : structuredClone(v); r.onsuccess?.(); pending--; maybeComplete(); });
-                  return r;
-                },
-                put: (data, key) => { idbStore.set(key, structuredClone(data)); },
-              }),
-              get oncomplete() { return completeFn; },
-              set oncomplete(fn) { completeFn = fn; queueMicrotask(maybeComplete); },
-            };
-            return tx;
-          },
-        };
-        req.onsuccess?.();
-      });
-      return req;
-    },
-  };
+  // In-memory IndexedDB stub. The EXTENSION and the CLAWSER PAGE have separate IndexedDB
+  // stores (different origins), so there are two independent fakes here:
+  //   idbStore  - the extension's own store (what background.js reads and writes)
+  //   pageIdb   - the clawser page's store (background.js can never see it)
+  // A routine only gets from the page to the extension through a `routines_sync` notify
+  // (see pageSync below). Seeding `idbStore` directly is a shortcut for tests of the
+  // scheduler's own internals; anything about routines *reaching* the scheduler must go
+  // through pageSync, or the very bug that hid in clawser#377 can hide again.
+  const { indexedDB: fakeIndexedDB, store: idbStore } = makeFakeIndexedDB(opts.idbStore);
+  const { store: pageIdb } = makeFakeIndexedDB();
 
   // A fresh vm context only gets true ECMAScript globals (Object, Array,
   // Promise, Date, Math, JSON, ...) — NEITHER the WHATWG globals Node adds
@@ -200,6 +211,16 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
     hooks.listener({ type: MARKER, direction: 'notify', action, ...extra }, sender, () => {});
   }
 
+  /**
+   * What clawser's extension routine bridge does: send the page's full routine list for a workspace
+   * through the notify channel, from a tab on a clawser origin. This is the ONLY legitimate way
+   * for routines to reach the extension.
+   */
+  function pageSync(routines, { wsId = 'ws1', url = 'https://clawser.erisera.com/#workspace/ws1', tabId = 5, tabUrl = url } = {}) {
+    hooks.listener({ type: MARKER, direction: 'notify', action: 'routines_sync', wsId, url, routines }, { tab: { id: tabId, url: tabUrl } }, () => {});
+    return new Promise((r) => setTimeout(r, 15));
+  }
+
   /** Fire the scheduler alarm as chrome.alarms would. */
   function fireAlarm() {
     return hooks.alarmListener({ name: 'clawser-scheduler' });
@@ -219,5 +240,5 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   /** Simulate a context-menu click. */
   function clickMenu(info, tab) { return hooks.menuListener?.(info, tab); }
 
-  return { sandbox, send, sendUi, install, clickMenu, notify, fireAlarm, chrome: chromeStub, idbStore, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
+  return { sandbox, send, sendUi, install, clickMenu, notify, fireAlarm, chrome: chromeStub, idbStore, pageIdb, pageSync, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
 }
