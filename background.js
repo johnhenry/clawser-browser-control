@@ -1697,14 +1697,6 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       req.onerror = () => resolve(null);
     });
 
-    const write = (key, data) => new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readwrite');
-      tx.objectStore(STORE).put(data, key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
-    });
-
     const routines = await read(ROUTINE_KEY);
     if (!Array.isArray(routines) || routines.length === 0) {
       db.close();
@@ -1765,25 +1757,57 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       }
     }
 
+    // What this run owns on each routine it ran. Applied later onto the *current*
+    // stored array (the page may have added, paused, edited or deleted routines
+    // while the slow run was going), never by writing back the array read above.
+    const ran = [];
     for (const r of due) {
       const { success, error } = await delegateRoutineExecution(r.id);
-      r.state = r.state || {};
-      r.state.lastRun = Date.now();
-      r.state.lastResult = success ? 'executed' : `skipped: ${error}`;
-      r.state.runCount = (r.state.runCount || 0) + 1;
-      if (r.trigger?.type === 'cron') r.state.lastCronMinute = Math.floor(now / 60000);
-      if (r.meta?.scheduleType === 'interval') r.meta.lastFired = now;
-      if (r.meta?.scheduleType === 'once') r.meta.fired = true;
+      const lastResult = success ? 'executed' : `skipped: ${error}`;
+      ran.push({
+        id: r.id,
+        lastRun: Date.now(),
+        lastResult,
+        lastCronMinute: r.trigger?.type === 'cron' ? Math.floor(now / 60000) : null,
+        interval: r.meta?.scheduleType === 'interval',
+        once: r.meta?.scheduleType === 'once',
+      });
       results.push({ routineId: r.id, success, error });
       if (!success) console.warn(`[clawser-ext] Routine "${r.name || r.id}" not executed: ${error}`);
     }
 
     if (results.length > 0) {
-      await write(ROUTINE_KEY, routines);
-      const log = (await read(LOG_KEY)) || [];
-      log.push({ timestamp: now, results });
-      while (log.length > 100) log.shift();
-      await write(LOG_KEY, log);
+      // One readwrite transaction (get, then put) so the merge is atomic in IDB.
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, 'readwrite');
+        const store = tx.objectStore(STORE);
+        const getRoutines = store.get(ROUTINE_KEY);
+        getRoutines.onsuccess = () => {
+          const current = Array.isArray(getRoutines.result) ? getRoutines.result : [];
+          for (const o of ran) {
+            const cur = current.find((c) => c && c.id === o.id);
+            if (!cur) continue; // deleted meanwhile: never bring it back
+            cur.state = cur.state || {};
+            cur.state.lastRun = o.lastRun;
+            cur.state.lastResult = o.lastResult;
+            cur.state.runCount = (cur.state.runCount || 0) + 1;
+            if (o.lastCronMinute !== null) cur.state.lastCronMinute = o.lastCronMinute;
+            if (cur.meta && o.interval) cur.meta.lastFired = now;
+            if (cur.meta && o.once) cur.meta.fired = true;
+          }
+          store.put(current, ROUTINE_KEY);
+          const getLog = store.get(LOG_KEY);
+          getLog.onsuccess = () => {
+            const log = Array.isArray(getLog.result) ? getLog.result : [];
+            log.push({ timestamp: now, results });
+            while (log.length > 100) log.shift();
+            store.put(log, LOG_KEY);
+          };
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
+      });
     }
 
     db.close();

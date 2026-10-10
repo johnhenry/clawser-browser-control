@@ -133,18 +133,28 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
         req.result = {
           objectStoreNames: { contains: () => true },
           close() {},
-          transaction: () => ({
-            objectStore: () => ({
-              get: (key) => {
-                const r = {};
-                queueMicrotask(() => { r.result = idbStore.get(key); r.onsuccess?.(); });
-                return r;
-              },
-              put: (data, key) => { idbStore.set(key, data); },
-            }),
-            get oncomplete() { return this._oncomplete; },
-            set oncomplete(fn) { this._oncomplete = fn; queueMicrotask(() => fn()); },
-          }),
+          transaction: () => {
+            // Completes once every request issued so far (including ones issued from
+            // inside a success callback) has finished, like a real IDB transaction.
+            let pending = 0; let completeFn = null; let completed = false;
+            const maybeComplete = () => {
+              if (pending === 0 && completeFn && !completed) { completed = true; queueMicrotask(() => completeFn()); }
+            };
+            const tx = {
+              objectStore: () => ({
+                get: (key) => {
+                  const r = {};
+                  pending++;
+                  queueMicrotask(() => { const v = idbStore.get(key); r.result = v === undefined ? undefined : structuredClone(v); r.onsuccess?.(); pending--; maybeComplete(); });
+                  return r;
+                },
+                put: (data, key) => { idbStore.set(key, structuredClone(data)); },
+              }),
+              get oncomplete() { return completeFn; },
+              set oncomplete(fn) { completeFn = fn; queueMicrotask(maybeComplete); },
+            };
+            return tx;
+          },
         };
         req.onsuccess?.();
       });
