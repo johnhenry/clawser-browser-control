@@ -564,30 +564,59 @@ async function actionFind({ tabId, query, selector }) {
   }, [query, selector]);
 }
 
-async function actionGetText({ tabId }) {
+async function actionGetText({ tabId, maxChars }) {
   const tid = await resolveTabId({ tabId });
-  return executeInTab(tid, () => {
+  return executeInTab(tid, (max) => {
     const article = document.querySelector('article') || document.querySelector('main');
     const source = article || document.body;
+    const full = source?.innerText?.trim() || '';
     return {
       title: document.title,
       url: location.href,
-      text: source?.innerText?.trim()?.slice(0, 50000) || '',
+      text: full.slice(0, max),
+      truncated: full.length > max,
+      length: full.length,
     };
-  });
+  }, [clampMaxChars(maxChars)]);
 }
 
 /**
  * Return the outer HTML of an element. Precedence when multiple params
  * are given: `selector` wins, then `ref`, then the whole `<html>` element.
+ * Optional: `strip: true` serializes a clone without script/style/noscript/
+ * template/svg/iframe/link/meta elements and comments; `maxChars` caps the
+ * returned length (default 50000, at most 2,000,000). The result carries
+ * `truncated` and `length` (the full length before slicing).
  */
-async function actionGetHtml({ tabId, selector, ref }) {
+async function actionGetHtml({ tabId, selector, ref, strip, maxChars }) {
   const tid = await resolveTabId({ tabId });
-  return executeInTab(tid, (sel) => {
+  return executeInTab(tid, (sel, doStrip, max) => {
     const el = sel ? document.querySelector(sel) : document.documentElement;
     if (!el) return { error: `Element not found: ${sel}` };
-    return { html: el.outerHTML.slice(0, 50000) };
-  }, [selector || ref || 'html']);
+    let html;
+    if (doStrip) {
+      const clone = el.cloneNode(true);
+      for (const n of Array.from(clone.querySelectorAll('script, style, noscript, template, svg, iframe, link, meta'))) n.remove();
+      const walker = document.createTreeWalker(clone, 128 /* NodeFilter.SHOW_COMMENT */);
+      const comments = [];
+      for (let c = walker.nextNode(); c; c = walker.nextNode()) comments.push(c);
+      for (const c of comments) c.remove();
+      html = clone.outerHTML;
+    } else {
+      html = el.outerHTML;
+    }
+    return { html: html.slice(0, max), truncated: html.length > max, length: html.length };
+  }, [selector || ref || 'html', strip === true, clampMaxChars(maxChars)]);
+}
+
+const DEFAULT_MAX_CHARS = 50000;
+const MAX_MAX_CHARS = 2000000;
+
+/** Valid positive number (or numeric string) -> floor, capped at 2,000,000; anything else -> 50000. */
+function clampMaxChars(v) {
+  const n = typeof v === 'number' || (typeof v === 'string' && v.trim() !== '') ? Number(v) : NaN;
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_CHARS;
+  return Math.min(Math.floor(n), MAX_MAX_CHARS);
 }
 
 // -- Input Simulation --
