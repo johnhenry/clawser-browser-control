@@ -209,6 +209,53 @@ describe('side panel: entry actions', () => {
   });
 });
 
+describe('side panel: notice (undelivered draft / capture fallback)', () => {
+  const undelivered = { kind: 'undelivered', message: "Couldn't send to clawser: open clawser and try again", detail: null, canRetry: true, draftKind: 'extract', sources: [{ title: 'Shop', url: 'https://s.example.com/' }] };
+  const base = (notice, extra = {}) => (m) => (m.action === 'btask_notice' ? { result: { notice } } : (extra[m.action] ? extra[m.action](m) : connected(m)));
+
+  it('is hidden when there is nothing to report', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: base(null) });
+    await p.tick(); await p.tick();
+    assert.equal(p.$('notice').hidden, true);
+  });
+
+  it('shows the undelivered draft as text with Retry', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: base(undelivered) });
+    await p.tick(); await p.tick();
+    assert.equal(p.$('notice').hidden, false);
+    assert.match(p.$('notice-text').textContent, /Couldn't send to clawser/);
+    assert.match(p.$('notice-sources').textContent, /Shop \(https:\/\/s\.example\.com\/\)/);
+    assert.equal(p.$('btn-retry').hidden, false);
+  });
+
+  it('a fallback note has no Retry', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: base({ kind: 'fallback', message: 'the whole tab was sent', detail: null, canRetry: false, sources: [] }) });
+    await p.tick(); await p.tick();
+    assert.equal(p.$('btn-retry').hidden, true);
+    assert.match(p.$('notice-text').textContent, /whole tab/);
+  });
+
+  it('Retry reports the outcome and Dismiss hides the notice and says so', async () => {
+    let retried = 0;
+    const p = loadSidepanel({ tabs: TABS, respond: base(undelivered, { btask_retry: () => { retried++; return { result: { ok: true } }; }, btask_dismiss: () => ({ result: { ok: true } }) }) });
+    await p.tick(); await p.tick();
+    p.$('btn-retry').click(); await p.tick(); await p.tick();
+    assert.equal(retried, 1);
+    assert.match(p.$('status').textContent, /Clawser has your draft/);
+    p.$('btn-dismiss').click(); await p.tick(); await p.tick();
+    assert.equal(p.$('notice').hidden, true);
+    assert.match(p.$('status').textContent, /Dismissed/);
+  });
+
+  it('a failed Retry says why and keeps the notice', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: base(undelivered, { btask_retry: () => ({ result: { ok: false, error: 'Clawser did not respond.' } }) }) });
+    await p.tick(); await p.tick();
+    p.$('btn-retry').click(); await p.tick(); await p.tick();
+    assert.match(p.$('status').textContent, /not delivered: Clawser did not respond/);
+    assert.equal(p.$('notice').hidden, false);
+  });
+});
+
 describe('side panel: markup agreement', () => {
   it('every element id the script uses exists in sidepanel.html', () => {
     const js = readFileSync(new URL('../sidepanel.js', import.meta.url), 'utf8');

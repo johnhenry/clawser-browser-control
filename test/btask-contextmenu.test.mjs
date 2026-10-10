@@ -277,3 +277,102 @@ describe('captureSectionInPage', () => {
     assert.equal(r.selector, null);
   });
 });
+
+describe('visible failures: badge, notice, retry, fallback note', () => {
+  const PANEL = { id: 'ext-id', url: 'chrome-extension://ext-id/sidepanel.html' };
+  const click = (b, id = 'clawser-extract') => b.clickMenu({ menuItemId: id, frameId: 0, targetElementId: 1 }, PAGE);
+
+  it('an undelivered draft sets the badge and title, and is kept for the side panel', async () => {
+    const { b } = setup({ tabs: [PAGE], reply: () => { throw new Error('no receiver'); }, capture: { selector: '#a', textHint: 'h' } });
+    await click(b);
+    assert.equal(b.badge.text, '!');
+    assert.match(b.badge.title, /Couldn't send to clawser: open clawser and try again/);
+    const n = (await b.sendUi({ action: 'btask_notice' }, PANEL)).result.notice;
+    assert.equal(n.kind, 'undelivered');
+    assert.equal(n.canRetry, true);
+    assert.equal(n.draftKind, 'extract');
+    assert.equal(n.sources[0].url, PAGE.url);
+    assert.equal(JSON.stringify(n).includes('tabId'), false);
+  });
+
+  it('Retry re-sends the kept draft, and success clears badge and notice', async () => {
+    let up = false;
+    const { b, sent } = setup({ tabs: [PAGE, CLAWSER], capture: { selector: '#a', textHint: 'h' }, reply: () => { if (!up) throw new Error('no receiver'); return { result: { accepted: true } }; } });
+    await click(b);
+    assert.equal(b.badge.text, '!');
+    up = true;
+    const r = await b.sendUi({ action: 'btask_retry' }, PANEL);
+    assert.equal(r.result.ok, true);
+    const last = sent.at(-1).msg.request;
+    assert.equal(last.origin, 'contextmenu');
+    assert.equal(last.sources[0].section.selector, '#a');
+    assert.equal(b.badge.text, '');
+    assert.equal((await b.sendUi({ action: 'btask_notice' }, PANEL)).result.notice, null);
+  });
+
+  it('a failed Retry keeps the notice and badge', async () => {
+    const { b } = setup({ tabs: [PAGE], reply: () => { throw new Error('no receiver'); }, capture: { selector: '#a', textHint: 'h' } });
+    await click(b);
+    const r = await b.sendUi({ action: 'btask_retry' }, PANEL);
+    assert.equal(r.result.ok, false);
+    assert.equal(b.badge.text, '!');
+    assert.equal((await b.sendUi({ action: 'btask_notice' }, PANEL)).result.notice.kind, 'undelivered');
+  });
+
+  it('Dismiss clears the badge, title and notice', async () => {
+    const { b } = setup({ tabs: [PAGE], reply: () => { throw new Error('x'); }, capture: { selector: '#a', textHint: 'h' } });
+    await click(b);
+    await b.sendUi({ action: 'btask_dismiss' }, PANEL);
+    assert.equal(b.badge.text, '');
+    assert.equal(b.badge.title, 'Clawser browser tasks');
+    assert.equal((await b.sendUi({ action: 'btask_notice' }, PANEL)).result.notice, null);
+  });
+
+  it('a later successful delivery clears an old undelivered notice', async () => {
+    let up = false;
+    const { b } = setup({ tabs: [PAGE, CLAWSER], capture: { selector: '#a', textHint: 'h' }, reply: () => { if (!up) throw new Error('x'); return { result: {} }; } });
+    await click(b);
+    up = true;
+    await click(b);
+    assert.equal(b.badge.text, '');
+  });
+
+  it('capture returning nothing falls back to the whole tab with a visible note, still delivered', async () => {
+    for (const capture of [null, new Error('Cannot access'), { selector: null, textHint: 'x' }]) {
+      const { b, sent } = setup({ capture });
+      await click(b);
+      assert.equal(sent[0].msg.request.sources[0].kind, 'tab');
+      assert.equal(b.badge.text, 'i');
+      assert.match(b.badge.title, /whole tab was sent/);
+      const n = (await b.sendUi({ action: 'btask_notice' }, PANEL)).result.notice;
+      assert.equal(n.kind, 'fallback');
+      assert.equal(n.canRetry, false);
+    }
+  });
+
+  it('fallback + undelivered keeps both facts; retry success leaves the fallback note', async () => {
+    let up = false;
+    const { b } = setup({ tabs: [PAGE, CLAWSER], capture: null, reply: () => { if (!up) throw new Error('x'); return { result: {} }; } });
+    await click(b);
+    const n = (await b.sendUi({ action: 'btask_notice' }, PANEL)).result.notice;
+    assert.equal(n.kind, 'undelivered');
+    assert.match(n.detail, /whole tab/);
+    up = true;
+    await b.sendUi({ action: 'btask_retry' }, PANEL);
+    assert.equal((await b.sendUi({ action: 'btask_notice' }, PANEL)).result.notice.kind, 'fallback');
+  });
+
+  it('a successful precise capture shows no notice', async () => {
+    const { b } = setup({ capture: { selector: '#a', textHint: 'h' } });
+    await click(b);
+    assert.equal(b.badge.text, '');
+  });
+
+  it('Retry with nothing pending is a clean refusal; non-extension callers are refused', async () => {
+    const { b } = setup();
+    assert.equal((await b.sendUi({ action: 'btask_retry' }, PANEL)).result.ok, false);
+    for (const action of ['btask_retry', 'btask_dismiss', 'btask_notice']) {
+      assert.ok((await b.sendUi({ action }, { id: 'ext-id', tab: { id: 1 }, url: 'http://localhost/' })).error);
+    }
+  });
+});

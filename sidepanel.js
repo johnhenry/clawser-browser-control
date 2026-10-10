@@ -128,7 +128,20 @@
       make('span', { class: 'meta', text: [n.body, when(n.at)].filter(Boolean).join(' - ') }))));
   }
 
+  async function refreshNotice() {
+    let n = null;
+    try { n = (await call('btask_notice')).notice; } catch { return; }
+    $('notice').hidden = !n;
+    if (!n) return;
+    $('notice-text').textContent = n.kind === 'undelivered'
+      ? `${n.message}.${n.detail ? ` ${n.detail}` : ''}`
+      : n.message;
+    $('notice-sources').replaceChildren(...n.sources.map((x) => make('li', { class: 'note', text: `${x.title || x.url} (${x.url})` })));
+    $('btn-retry').hidden = !n.canRetry;
+  }
+
   async function refresh() {
+    refreshNotice();
     const seq = ++refreshSeq;
     let list;
     let inbox;
@@ -264,6 +277,23 @@
     if (ev.key === 'Escape') { ev.preventDefault(); $('btn-cancel').click(); }
   });
   $('btn-refresh').addEventListener('click', () => { say('Refreshing...'); refresh().then(() => say('Updated.')); });
+  $('btn-retry').addEventListener('click', async () => {
+    say('Retrying...');
+    try {
+      const r = await call('btask_retry');
+      say(r.ok ? 'Clawser has your draft. Confirm it there to run it.' : `The draft was not delivered: ${r.error || 'unknown error'}`);
+    } catch (e) {
+      say(`The draft was not delivered: ${e.message}`);
+    }
+    await refreshNotice();
+    if ($('notice').hidden) $('btn-compare').focus(); else $('btn-retry').focus();
+  });
+  $('btn-dismiss').addEventListener('click', async () => {
+    try { await call('btask_dismiss'); } catch (e) { say(`Could not dismiss: ${e.message}`); return; }
+    $('notice').hidden = true;
+    say('Dismissed.');
+    $('btn-compare').focus();
+  });
   $('btn-open-clawser').addEventListener('click', async () => {
     try {
       await call('btask_open');

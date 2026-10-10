@@ -2109,6 +2109,13 @@ async function handleUiMessage(msg, sender) {
       return btaskDraftFromPanel(msg);
     case 'btask_open':
       return btaskOpenClawser();
+    case 'btask_notice':
+      return { notice: publicNotice(await getNotice()) };
+    case 'btask_dismiss':
+      await clearNotice();
+      return { ok: true };
+    case 'btask_retry':
+      return btaskRetry();
     default:
       throw new Error(`Unknown action: ${msg.action}`);
   }
@@ -2264,6 +2271,66 @@ async function btaskFetch(type, field, normalize) {
   return { connected: true, [field]: normalize(r.result?.[field]) };
 }
 
+// ---- Notices (undelivered drafts, capture fallbacks) ----
+// A context-menu action happens outside any UI, so a problem must be visible:
+// the toolbar badge + title say so, and the side panel shows the notice (with
+// Retry for an undelivered draft) until it is delivered or dismissed.
+
+const NOTICE_KEY = 'btaskNotice';
+const ACTION_DEFAULT_TITLE = 'Clawser browser tasks';
+let memoryNotice = null; // fallback when chrome.storage.session is unavailable
+
+async function getNotice() {
+  try {
+    if (chrome.storage?.session) {
+      const o = await chrome.storage.session.get(NOTICE_KEY);
+      return o?.[NOTICE_KEY] || null;
+    }
+  } catch { /* fall through to memory */ }
+  return memoryNotice;
+}
+
+async function setNotice(notice) {
+  memoryNotice = notice;
+  try { await chrome.storage?.session?.set({ [NOTICE_KEY]: notice }); } catch { /* memory copy remains */ }
+  try {
+    await chrome.action?.setBadgeText({ text: notice.kind === 'undelivered' ? '!' : 'i' });
+    await chrome.action?.setTitle({ title: notice.message });
+  } catch { /* badge is best-effort */ }
+}
+
+async function clearNotice() {
+  memoryNotice = null;
+  try { await chrome.storage?.session?.remove(NOTICE_KEY); } catch { /* ignore */ }
+  try {
+    await chrome.action?.setBadgeText({ text: '' });
+    await chrome.action?.setTitle({ title: ACTION_DEFAULT_TITLE });
+  } catch { /* ignore */ }
+}
+
+function publicNotice(n) {
+  if (!n) return null;
+  return {
+    kind: n.kind,
+    message: clampText(n.message, 300),
+    detail: n.fellBack ? clampText(n.fellBack, 300) : null,
+    canRetry: n.kind === 'undelivered' && !!n.draft,
+    draftKind: n.draft ? n.draft.kind : null,
+    sources: n.draft ? n.draft.sources.map((x) => ({ title: x.title, url: x.url })) : [],
+  };
+}
+
+async function btaskRetry() {
+  const notice = await getNotice();
+  if (!notice || notice.kind !== 'undelivered' || !notice.draft) return { ok: false, error: 'There is no undelivered draft to retry' };
+  const r = await sendDraft(notice.draft);
+  if (r.ok) {
+    if (notice.fellBack) await setNotice({ kind: 'fallback', message: notice.fellBack, at: Date.now() });
+    else await clearNotice();
+  }
+  return r;
+}
+
 // ---- Context menus ----
 
 chrome.contextMenus?.onClicked.addListener((info, tab) => {
@@ -2284,8 +2351,27 @@ async function handleMenuClick(info, tab) {
 
   const source = { kind: section ? 'section' : 'tab', url, title: clampText(tab.title, BTASK_MAX_TITLE), tabId: tab.id, capturedAt: new Date().toISOString() };
   if (section) source.section = section;
-  const r = await sendDraft({ kind, sources: [source], origin: 'contextmenu' });
-  if (!r.ok) console.warn('[clawser-ext] Draft not delivered:', r.error);
+  // Capture can fail on its own (restricted page, no frame access, the browser
+  // not offering the clicked element). Fall back to the whole tab, and say so.
+  const fellBack = wantSection && !section
+    ? `Couldn't pick out that section on "${source.title || source.url}", so the whole tab was sent. Choose the section in clawser.`
+    : null;
+
+  const draft = { kind, sources: [source], origin: 'contextmenu' };
+  const r = await sendDraft(draft);
+  if (r.ok) {
+    if (fellBack) await setNotice({ kind: 'fallback', message: fellBack, at: Date.now() });
+    else await clearNotice();
+    return;
+  }
+  console.warn('[clawser-ext] Draft not delivered:', r.error);
+  await setNotice({
+    kind: 'undelivered',
+    message: "Couldn't send to clawser: open clawser and try again",
+    fellBack,
+    draft,
+    at: Date.now(),
+  });
 }
 
 /**

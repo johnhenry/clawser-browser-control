@@ -46,6 +46,8 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   const menusCreated = []; // chrome.contextMenus.create() props, in order
   const registered = []; // chrome.scripting.registerContentScripts() entries currently registered
   const localStore = { ...(opts.storage || {}) }; // chrome.storage.local backing object
+  const sessionStore = {}; // chrome.storage.session backing object
+  const badge = { text: '', title: '' }; // chrome.action state
   const panelBehavior = []; // chrome.sidePanel.setPanelBehavior() args
 
   const defaultChrome = {
@@ -102,6 +104,15 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
         set: async (obj) => { Object.assign(localStore, obj); },
         remove: async (keys) => { for (const k of [].concat(keys)) delete localStore[k]; },
       },
+      session: {
+        get: async (k) => { const o = {}; for (const key of [].concat(k)) if (key in sessionStore) o[key] = sessionStore[key]; return o; },
+        set: async (obj) => { Object.assign(sessionStore, obj); },
+        remove: async (k) => { for (const key of [].concat(k)) delete sessionStore[key]; },
+      },
+    },
+    action: {
+      setBadgeText: async ({ text }) => { badge.text = text; },
+      setTitle: async ({ title }) => { badge.title = title; },
     },
     sidePanel: { setPanelBehavior: async (b) => { panelBehavior.push(b); } },
     userScripts: undefined,
@@ -198,5 +209,5 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   /** Simulate a context-menu click. */
   function clickMenu(info, tab) { return hooks.menuListener?.(info, tab); }
 
-  return { sandbox, send, sendUi, install, clickMenu, notify, fireAlarm, chrome: chromeStub, idbStore, menusCreated, registered, localStore, panelBehavior, hooks };
+  return { sandbox, send, sendUi, install, clickMenu, notify, fireAlarm, chrome: chromeStub, idbStore, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
 }

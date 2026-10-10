@@ -12,6 +12,16 @@
 
     <p id="status" class="status" role="status" aria-live="polite"></p>
 
+    <section id="notice" aria-labelledby="notice-h" hidden>
+      <h2 id="notice-h">Needs your attention</h2>
+      <p id="notice-text"></p>
+      <ul id="notice-sources" class="plain"></ul>
+      <div class="row">
+        <button type="button" id="btn-retry" hidden>Retry</button>
+        <button type="button" id="btn-dismiss">Dismiss</button>
+      </div>
+    </section>
+
     <section aria-labelledby="start-h">
       <h2 id="start-h">Start a task</h2>
       <p class="hint">Each action prepares a draft in clawser. Nothing runs until you confirm it there.</p>
