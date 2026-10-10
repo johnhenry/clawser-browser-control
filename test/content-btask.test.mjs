@@ -151,6 +151,16 @@ describe('content.js btask request bridge', () => {
     assert.deepEqual(JSON.parse(JSON.stringify(await b)), { result: { notifications: [] } });
   });
 
+  it('relays the ping used by the handshake', async (t) => {
+    const ctx = await freshLoad(t);
+    const p = ctx.requestFromBackground({ type: MARKER, direction: 'btask_request', request: { type: 'clawser.btask.ping' }, timeoutMs: 1000 });
+    await tick();
+    const [pushed] = ctx.popPosted().filter((m) => m.direction === 'push');
+    assert.equal(pushed.request.type, 'clawser.btask.ping');
+    ctx.postFromPage({ type: MARKER, direction: 'btask_response', id: pushed.id, result: { pong: true } });
+    assert.deepEqual(JSON.parse(JSON.stringify(await p)), { result: { pong: true } });
+  });
+
   it('refuses request types other than the three btask messages', async (t) => {
     const ctx = await freshLoad(t);
     for (const request of [{ type: 'clawser.other' }, { type: 'evaluate' }, null, 'x', {}]) {

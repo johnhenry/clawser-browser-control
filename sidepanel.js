@@ -165,18 +165,33 @@
 
   function tabLabel(t) { return t.title || t.url; }
 
-  function renderPicker() {
+  let optionInputs = new Map(); // tab id -> its input element
+
+  // The option list is built once when the picker opens. Toggling only updates
+  // `.checked` and the selected list, so the focused control is never destroyed
+  // (rebuilding it dropped keyboard focus to <body>).
+  function buildOptions() {
     const cfg = PICKERS[mode];
     const type = cfg.multiple ? 'checkbox' : 'radio';
+    optionInputs = new Map();
     $('tab-options-empty').hidden = openTabs.length > 0;
     $('tab-options').replaceChildren(...openTabs.map((t) => {
       const id = `tab-opt-${t.id}`;
       const input = make('input', { type, id, name: 'tab', value: String(t.id) });
       input.checked = selected.includes(t.id);
       input.addEventListener('change', () => onToggle(t.id, input.checked));
+      optionInputs.set(t.id, input);
       return make('li', {}, make('label', { class: 'tab-label', for: id },
         input, make('span', { class: 't', text: ` ${tabLabel(t)}` }), make('span', { class: 'u', text: t.url })));
     }));
+  }
+
+  function renderPicker() {
+    const cfg = PICKERS[mode];
+    for (const [id, input] of optionInputs) {
+      const want = selected.includes(id);
+      if (input.checked !== want) input.checked = want;
+    }
 
     const chosen = selected.map((id) => openTabs.find((t) => t.id === id)).filter(Boolean);
     $('selected-count').textContent = chosen.length
@@ -184,7 +199,11 @@
       : `None selected. Choose ${cfg.multiple ? `at least ${cfg.min}` : 'one'}.`;
     $('selected-list').replaceChildren(...chosen.map((t) => {
       const rm = make('button', { type: 'button', 'aria-label': `Remove ${tabLabel(t)} from the selection`, text: 'Remove' });
-      rm.addEventListener('click', () => { onToggle(t.id, false); $('btn-send').focus(); });
+      rm.addEventListener('click', () => {
+        onToggle(t.id, false);
+        const box = optionInputs.get(t.id);
+        if (box) box.focus(); else $('btn-send').focus();
+      });
       return make('li', {}, make('span', { text: `${tabLabel(t)} (${t.url}) ` }), rm);
     }));
     const ok = chosen.length >= cfg.min && !sending;
@@ -218,6 +237,7 @@
       say(`Could not list tabs: ${e.message}`);
     }
     $('picker').hidden = false;
+    buildOptions();
     renderPicker();
     $('picker-title').focus();
     say(`${cfg.title}: choose ${cfg.multiple ? 'two or more tabs' : 'a tab'}, then send the draft to clawser.`);

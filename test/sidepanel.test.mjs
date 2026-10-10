@@ -265,3 +265,49 @@ describe('side panel: markup agreement', () => {
     for (const id of used) assert.match(html, new RegExp(`id="${id}"`), id);
   });
 });
+
+describe('side panel: keyboard focus survives toggling (real-browser bug)', () => {
+  it('toggling a tab keeps the same checkbox elements, and focus stays on the toggled one', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: connected });
+    await p.tick(); await p.tick();
+    p.$('btn-compare').click(); await p.tick();
+    const before = p.$('tab-options').children.slice();
+    const boxes = p.$('tab-options').find((e) => e.attrs.type === 'checkbox');
+    assert.equal(boxes[0].attrs.id, 'tab-opt-1');
+    boxes[0].focus();
+    boxes[0].checked = true; boxes[0].fire('change');
+    assert.equal(p.doc.focused, boxes[0]);
+    assert.equal(p.$('tab-options').find((e) => e.attrs.id === 'tab-opt-1')[0], boxes[0], 'same node, not rebuilt');
+    p.$('tab-options').children.forEach((c, i) => assert.equal(c, before[i]));
+    boxes[1].focus();
+    boxes[1].checked = true; boxes[1].fire('change');
+    assert.equal(p.doc.focused, boxes[1]);
+    boxes[1].checked = false; boxes[1].fire('change');
+    assert.equal(p.doc.focused, boxes[1]);
+    assert.equal(boxes[1].checked, false);
+  });
+
+  it('removing from the selected list unchecks the option in place', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: connected });
+    await p.tick(); await p.tick();
+    p.$('btn-compare').click(); await p.tick();
+    const boxes = p.$('tab-options').find((e) => e.attrs.type === 'checkbox');
+    for (const i of [0, 1]) { boxes[i].checked = true; boxes[i].fire('change'); }
+    p.$('selected-list').children[0].find((e) => e.tagName === 'BUTTON')[0].click();
+    assert.equal(boxes[0].checked, false);
+    assert.equal(boxes[1].checked, true);
+    assert.equal(p.$('tab-options').find((e) => e.attrs.id === 'tab-opt-1')[0], boxes[0]);
+  });
+
+  it('single-choice mode switches the checked radio without rebuilding', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: connected });
+    await p.tick(); await p.tick();
+    p.$('btn-extract').click(); await p.tick();
+    const radios = p.$('tab-options').find((e) => e.attrs.type === 'radio');
+    radios[1].focus();
+    radios[1].checked = true; radios[1].fire('change');
+    assert.equal(radios[0].checked, false);
+    assert.equal(radios[1].checked, true);
+    assert.equal(p.doc.focused, radios[1]);
+  });
+});

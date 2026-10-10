@@ -13,7 +13,7 @@ function setup({ capture, tabs = [CLAWSER, PAGE], reply } = {}) {
     tabs: {
       query: async () => tabs.map((t) => ({ ...t })),
       get: async (id) => ({ ...tabs.find((t) => t.id === id) }),
-      sendMessage: async (tabId, msg) => { sent.push({ tabId, msg }); return reply ? reply(tabId, msg) : { result: { accepted: true } }; },
+      sendMessage: async (tabId, msg) => { if (msg.request?.type !== 'clawser.btask.ping') sent.push({ tabId, msg }); return reply ? reply(tabId, msg) : { result: { accepted: true } }; },
       update: async () => ({}),
     },
     windows: { update: async () => ({}) },
@@ -26,26 +26,53 @@ function setup({ capture, tabs = [CLAWSER, PAGE], reply } = {}) {
       },
       registerContentScripts: async () => {}, unregisterContentScripts: async () => {},
     },
-  }, { setTimeoutImpl: (fn, ms) => setTimeout(fn, Math.min(ms, 1)) });
+  }, { setTimeoutImpl: (fn, ms) => setTimeout(fn, ms >= 10000 ? ms : Math.min(ms, 1)) });
   return { b, sent, execCalls };
 }
 
 describe('context menu registration', () => {
-  it('creates the three entries on install', async () => {
+  const byId = (b) => Object.fromEntries(b.menusCreated.map((m) => [m.id, m]));
+
+  it('Chrome (no getTargetElement): honest selection / page items', async () => {
     const { b } = setup();
     await b.install();
-    const byId = Object.fromEntries(b.menusCreated.map((m) => [m.id, m]));
-    assert.equal(byId['clawser-extract'].title, 'Extract data from this section');
-    assert.equal(byId['clawser-compare'].title, 'Compare with other tabs');
-    assert.equal(byId['clawser-watch'].title, 'Watch this section');
-    assert.equal(b.menusCreated.length, 3);
+    const m = byId(b);
+    assert.equal(b.menusCreated.length, 4);
+    assert.equal(m['clawser-extract'].title, 'Extract data from the selection');
+    assert.deepEqual([...m['clawser-extract'].contexts], ['selection']);
+    assert.equal(m['clawser-extract-page'].title, 'Extract data from this page');
+    assert.deepEqual([...m['clawser-extract-page'].contexts], ['page']);
+    assert.equal(m['clawser-watch'].title, 'Watch the selection');
+    assert.deepEqual([...m['clawser-watch'].contexts], ['selection']);
+    assert.equal(m['clawser-compare'].title, 'Compare with other tabs');
+    assert.ok(m['clawser-compare'].contexts.includes('page') && m['clawser-compare'].contexts.includes('selection'));
+  });
+
+  it('a browser that offers getTargetElement (feature-detected) keeps the section items', async () => {
+    for (const ns of ['menus', 'contextMenus']) {
+      const b = loadBackground({
+        [ns]: {
+          getTargetElement: () => null,
+          create: (p) => { menus.push(p); return p.id; }, removeAll: async () => { menus.length = 0; },
+          onClicked: { addListener: () => {} },
+        },
+        ...(ns === 'menus' ? { contextMenus: undefined } : {}),
+      });
+      var menus = [];
+      await b.install();
+      const m = Object.fromEntries(menus.map((x) => [x.id, x]));
+      assert.equal(m['clawser-extract'].title, 'Extract data from this section', ns);
+      assert.equal(m['clawser-watch'].title, 'Watch this section', ns);
+      assert.ok(m['clawser-extract'].contexts.includes('page'), ns);
+      assert.equal(m['clawser-extract-page'], undefined, ns);
+    }
   });
 
   it('install is idempotent (removeAll before create)', async () => {
     const { b } = setup();
     await b.install();
     await b.install();
-    assert.equal(b.menusCreated.length, 3);
+    assert.equal(b.menusCreated.length, 4);
   });
 
   it('makes the toolbar button open the side panel when the API exists', async () => {
@@ -57,7 +84,7 @@ describe('context menu registration', () => {
   it('does not throw when sidePanel is unavailable (Firefox)', async () => {
     const b = loadBackground({ sidePanel: undefined });
     await b.install();
-    assert.equal(b.menusCreated.length, 3);
+    assert.ok(b.menusCreated.length >= 3);
   });
 });
 
@@ -275,6 +302,18 @@ describe('captureSectionInPage', () => {
     const doc = makeDoc(el('body', {}, []));
     const r = runCapture(doc, null);
     assert.equal(r.selector, null);
+  });
+});
+
+describe('"Extract data from this page" (Chrome)', () => {
+  it('sends the whole tab without touching the page', async () => {
+    const { b, sent, execCalls } = setup();
+    await b.clickMenu({ menuItemId: 'clawser-extract-page', frameId: 0 }, PAGE);
+    assert.equal(execCalls.length, 0);
+    const s = sent[0].msg.request.sources[0];
+    assert.equal(sent[0].msg.request.kind, 'extract');
+    assert.equal(s.kind, 'tab');
+    assert.equal(b.badge.text, '');
   });
 });
 

@@ -40,7 +40,7 @@ Required to show the Clawser browser-tasks panel beside the page: four task laun
 
 contextMenus
 ------------
-Required to add the right-click entries "Extract data from this section", "Compare with other tabs" and "Watch this section". When the user picks one, the extension records a selector and a short text hint for the clicked element and sends it to the user's Clawser tab as a draft. Nothing is read in the background and nothing runs until the user confirms in Clawser.
+Required to add the right-click entries "Extract data from the selection", "Extract data from this page", "Compare with other tabs" and "Watch the selection". When the user picks one, the extension records a selector and a short text hint for the selected text (or just the page address and title) and sends it to the user's Clawser tab as a draft. Nothing is read in the background and nothing runs until the user confirms in Clawser.
 
 debugger (optional)
 -------------------

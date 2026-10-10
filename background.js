@@ -1946,12 +1946,15 @@ const BTASK_MAX_URL = 2000;
 const BTASK_MAX_SELECTOR = 300;
 const BTASK_MAX_HINT = 120;
 const BTASK_REPLY_TIMEOUT_MS = 5000;
+const BTASK_PING_TIMEOUT_MS = 1000;
+const BTASK_DELIVERY_BUDGET_MS = 20000;
 const BTASK_OPEN_ATTEMPTS = 25;
 const BTASK_OPEN_RETRY_MS = 600;
 const BTASK_MAX_CANDIDATE_TABS = 5;
 
 const MENU_KINDS = new Map([
   ['clawser-extract', 'extract'],
+  ['clawser-extract-page', 'extract'],
   ['clawser-compare', 'compare'],
   ['clawser-watch', 'monitor'],
 ]);
@@ -2077,14 +2080,31 @@ async function setupBrowserTasks({ menus }) {
   if (menus) await createContextMenus();
 }
 
+/** Does this browser let a menu click resolve the right-clicked element? (Firefox: yes; Chrome: no.) */
+function canResolveClickedElement() {
+  return !!((chrome.menus && chrome.menus.getTargetElement) || (chrome.contextMenus && chrome.contextMenus.getTargetElement));
+}
+
 async function createContextMenus() {
-  if (!chrome.contextMenus) return;
+  const api = chrome.contextMenus || chrome.menus;
+  if (!api) return;
   try {
-    await chrome.contextMenus.removeAll();
-    const contexts = ['page', 'selection', 'link', 'image', 'video', 'audio', 'frame'];
-    chrome.contextMenus.create({ id: 'clawser-extract', title: 'Extract data from this section', contexts });
-    chrome.contextMenus.create({ id: 'clawser-compare', title: 'Compare with other tabs', contexts });
-    chrome.contextMenus.create({ id: 'clawser-watch', title: 'Watch this section', contexts });
+    await api.removeAll();
+    if (canResolveClickedElement()) {
+      // The clicked element can be found, so "section" is honest.
+      const contexts = ['page', 'selection', 'link', 'image', 'video', 'audio', 'frame'];
+      api.create({ id: 'clawser-extract', title: 'Extract data from this section', contexts });
+      api.create({ id: 'clawser-compare', title: 'Compare with other tabs', contexts });
+      api.create({ id: 'clawser-watch', title: 'Watch this section', contexts });
+    } else {
+      // Chrome cannot tell us which element was clicked, and a content script on
+      // every site is not worth it. So offer exactly what we can do: the
+      // selection, or the whole page.
+      api.create({ id: 'clawser-extract', title: 'Extract data from the selection', contexts: ['selection'] });
+      api.create({ id: 'clawser-extract-page', title: 'Extract data from this page', contexts: ['page'] });
+      api.create({ id: 'clawser-compare', title: 'Compare with other tabs', contexts: ['page', 'selection'] });
+      api.create({ id: 'clawser-watch', title: 'Watch the selection', contexts: ['selection'] });
+    }
   } catch (e) {
     console.warn('[clawser-ext] Could not create context menus:', e);
   }
@@ -2162,22 +2182,33 @@ function serializedDelivery(fn) {
 }
 
 /**
- * Ask one tab. Returns { transport: true } when nothing there answered
- * (no content script, no receiver yet, timeout), { error } when the page
+ * Send one request to one tab. Returns { transport: true } when nothing there
+ * answered (no content script, no receiver, timeout), { error } when the page
  * answered with an error, { result } otherwise.
  */
-async function askClawserTab(tabId, request) {
+async function sendToTab(tabId, request, timeoutMs) {
   let resp;
   try {
-    resp = await chrome.tabs.sendMessage(tabId, {
-      type: MARKER, direction: 'btask_request', request, timeoutMs: BTASK_REPLY_TIMEOUT_MS,
-    });
+    resp = await chrome.tabs.sendMessage(tabId, { type: MARKER, direction: 'btask_request', request, timeoutMs });
   } catch {
     return { transport: true };
   }
   if (!resp || resp.transportError) return { transport: true };
   if (resp.error) return { error: clampText(String(resp.error), 300) };
   return { result: resp.result };
+}
+
+/**
+ * Ask one tab. A short handshake comes first: a tab whose page has no receiver
+ * is given up on after ~1 s instead of waiting out the full reply timeout.
+ * Any reply to the ping, even an error, shows a receiver is there.
+ */
+async function askClawserTab(tabId, request) {
+  const ping = await sendToTab(tabId, { type: 'clawser.btask.ping' }, BTASK_PING_TIMEOUT_MS);
+  if (ping.transport) return { transport: true };
+  const r = await sendToTab(tabId, request, BTASK_REPLY_TIMEOUT_MS);
+  if (r.error) return { error: clampText(String(r.error), 300) };
+  return r;
 }
 
 async function findClawserTabs() {
@@ -2192,19 +2223,34 @@ async function findClawserTabs() {
 /**
  * Deliver a request to a connected Clawser tab. With `open`, opens Clawser
  * (configured origin, else production) when none answers and retries until
- * the new page acknowledges.
+ * the new page acknowledges. The whole attempt is capped at
+ * BTASK_DELIVERY_BUDGET_MS; after that it reports not connected and stops
+ * sending.
  */
-async function deliverToClawser(request, { open }) {
+function deliverToClawser(request, { open }) {
+  const state = { cancelled: false };
+  let timer;
+  const budget = new Promise((resolve) => {
+    timer = setTimeout(() => { state.cancelled = true; resolve({ connected: false, timedOut: true }); }, BTASK_DELIVERY_BUDGET_MS);
+  });
+  const work = deliverUnbounded(request, open, state).finally(() => clearTimeout(timer));
+  work.catch(() => {}); // a late failure after the budget must not be an unhandled rejection
+  return Promise.race([work, budget]);
+}
+
+async function deliverUnbounded(request, open, state) {
   for (const tab of await findClawserTabs()) {
+    if (state.cancelled) return { connected: false };
     const r = await askClawserTab(tab.id, request);
     if (!r.transport) return { connected: true, tabId: tab.id, ...r };
   }
-  if (!open) return { connected: false };
+  if (!open || state.cancelled) return { connected: false };
 
   const custom = await getCustomOrigin();
   const tab = await chrome.tabs.create({ url: `${custom || DEFAULT_CLAWSER_ORIGIN}/`, active: true });
-  for (let i = 0; i < BTASK_OPEN_ATTEMPTS; i++) {
+  for (let i = 0; i < BTASK_OPEN_ATTEMPTS && !state.cancelled; i++) {
     await sleep(BTASK_OPEN_RETRY_MS);
+    if (state.cancelled) break;
     const r = await askClawserTab(tab.id, request);
     if (!r.transport) return { connected: true, opened: true, tabId: tab.id, ...r };
     try { await chrome.tabs.get(tab.id); } catch { break; } // user closed it
@@ -2362,7 +2408,7 @@ async function btaskRetry() {
 
 // ---- Context menus ----
 
-chrome.contextMenus?.onClicked.addListener((info, tab) => {
+(chrome.contextMenus || chrome.menus)?.onClicked.addListener((info, tab) => {
   return handleMenuClick(info, tab).catch((e) => console.warn('[clawser-ext] Context-menu action failed:', e));
 });
 
@@ -2375,7 +2421,7 @@ async function handleMenuClick(info, tab) {
 
   const selected = typeof info.selectionText === 'string' ? clampText(info.selectionText, 500) : '';
   // Compare takes the whole tab unless the user selected something.
-  const wantSection = kind !== 'compare' || selected !== '';
+  const wantSection = id !== 'clawser-extract-page' && (kind !== 'compare' || selected !== '');
   const section = wantSection ? await captureSection(tab.id, info, selected) : null;
 
   const source = { kind: section ? 'section' : 'tab', url, title: clampText(tab.title, BTASK_MAX_TITLE), tabId: tab.id, capturedAt: new Date().toISOString() };

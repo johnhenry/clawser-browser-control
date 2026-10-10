@@ -248,7 +248,7 @@ window.addEventListener('message', async (ev) => {
 // The side panel / context menus ask the Clawser page for its task list or
 // hand it a draft. Only the three clawser.btask.* request types are relayed,
 // only to an allowed-origin page, and only from this extension.
-const BTASK_TYPES = ['clawser.btask.draft', 'clawser.btask.list', 'clawser.btask.inbox'];
+const BTASK_TYPES = ['clawser.btask.draft', 'clawser.btask.list', 'clawser.btask.inbox', 'clawser.btask.ping'];
 const BTASK_DEFAULT_TIMEOUT_MS = 5000;
 const BTASK_MAX_TIMEOUT_MS = 8000;
 const btaskPending = new Map(); // id -> { respond, timer }

@@ -13,7 +13,8 @@ const SHOP_TAB = { id: 12, windowId: 7, url: 'https://shop.example.com/p', title
 
 /** Build a background with the given tabs and a programmable clawser page. */
 function setup({ tabs = [CLAWSER_TAB, NEWS_TAB, SHOP_TAB], reply, storage } = {}) {
-  const sent = []; // { tabId, msg }
+  const sent = []; // { tabId, msg } for real requests (pings excluded)
+  const calls = []; // every tabs.sendMessage, pings included
   const updates = [];
   const winUpdates = [];
   const created = [];
@@ -23,7 +24,8 @@ function setup({ tabs = [CLAWSER_TAB, NEWS_TAB, SHOP_TAB], reply, storage } = {}
       query: async () => allTabs.map((t) => ({ ...t })),
       get: async (id) => { const t = allTabs.find((x) => x.id === id); if (!t) throw new Error('No tab with id'); return { ...t }; },
       sendMessage: async (tabId, msg) => {
-        sent.push({ tabId, msg });
+        calls.push({ tabId, msg });
+        if (msg.request?.type !== 'clawser.btask.ping') sent.push({ tabId, msg });
         const t = allTabs.find((x) => x.id === tabId);
         if (!t) throw new Error('Could not establish connection');
         return reply ? reply(tabId, msg) : { result: { accepted: true } };
@@ -32,8 +34,8 @@ function setup({ tabs = [CLAWSER_TAB, NEWS_TAB, SHOP_TAB], reply, storage } = {}
       create: async (o) => { const t = { id: 900 + created.length, windowId: 7, url: o.url }; created.push(o); allTabs.push(t); return t; },
     },
     windows: { update: async (id, props) => { winUpdates.push({ id, props }); return { id }; } },
-  }, { storage, setTimeoutImpl: (fn, ms) => setTimeout(fn, Math.min(ms, 1)) });
-  return { b, sent, updates, winUpdates, created, allTabs };
+  }, { storage, setTimeoutImpl: (fn, ms) => setTimeout(fn, ms >= 10000 ? ms : Math.min(ms, 1)) });
+  return { b, sent, calls, updates, winUpdates, created, allTabs };
 }
 
 const tabSource = (t) => ({ kind: 'tab', tabId: t.id });
@@ -118,13 +120,14 @@ describe('btask_draft from the side panel', () => {
 
   it('falls through to the next clawser tab when the first has no responding page', async () => {
     const other = { id: 51, windowId: 8, url: 'http://localhost:5173/', title: 'dev', lastAccessed: 999 };
-    const { b, sent } = setup({
+    const { b, sent, calls } = setup({
       tabs: [CLAWSER_TAB, other, NEWS_TAB],
       reply: (tabId) => (tabId === 51 ? { transportError: 'no_response' } : { result: { accepted: true } }),
     });
     const r = await b.sendUi({ action: 'btask_draft', kind: 'extract', sources: [tabSource(NEWS_TAB)] }, PANEL);
     assert.equal(r.result.ok, true);
-    assert.deepEqual(sent.map((s) => s.tabId), [51, 50]);
+    assert.deepEqual(calls.map((s) => s.tabId), [51, 50, 50]);
+    assert.deepEqual(sent.map((s) => s.tabId), [50]);
   });
 
   it('surfaces a validation error returned by clawser without trying other tabs or focusing', async () => {
@@ -147,7 +150,7 @@ describe('btask_draft from the side panel', () => {
 describe('opening clawser when none is connected', () => {
   it('opens the production origin, retries until the page acks, then focuses it', async () => {
     let attempts = 0;
-    const { b, created, updates, sent } = setup({
+    const { b, created, updates, calls } = setup({
       tabs: [NEWS_TAB],
       reply: () => { attempts++; if (attempts < 3) throw new Error('Could not establish connection. Receiving end does not exist.'); return { result: { accepted: true } }; },
     });
@@ -156,7 +159,7 @@ describe('opening clawser when none is connected', () => {
     assert.equal(r.result.opened, true);
     assert.equal(created.length, 1);
     assert.equal(created[0].url, 'https://clawser.erisera.com/');
-    assert.ok(sent.length >= 3);
+    assert.ok(calls.length >= 3);
     assert.equal(updates.at(-1).id, 900);
   });
 
