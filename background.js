@@ -1514,6 +1514,14 @@ const pendingRoutineExecutions = new Map();
 /** @type {Map<number, Function>} tabId -> resolve fn, for tabs we're waiting on to report ready */
 const pendingReadyWaiters = new Map();
 
+/** Tabs the scheduler opened for a routine and will close again. Browser-task
+ * drafts and requests must never be delivered to one of these. */
+const schedulerOwnedTabs = new Set();
+
+/** True while an alarm is processing due routines, so a slow run is not
+ * started a second time by the next minute's alarm. */
+let schedulerBusy = false;
+
 // Set up the alarm on extension install/update
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(SCHEDULER_ALARM_NAME, { periodInMinutes: 1 });
@@ -1611,6 +1619,7 @@ async function delegateRoutineExecution(routineId) {
   } catch (e) {
     return { success: false, error: `Could not open a tab to run this routine: ${e.message}` };
   }
+  schedulerOwnedTabs.add(openedTab.id);
 
   const ready = await new Promise((resolve) => {
     const timer = setTimeout(() => { pendingReadyWaiters.delete(openedTab.id); resolve(false); }, TAB_OPEN_WAIT_MS);
@@ -1622,6 +1631,7 @@ async function delegateRoutineExecution(routineId) {
     : { success: false, error: 'Opened a tab but it did not report ready in time' };
 
   try { await chrome.tabs.remove(openedTab.id); } catch { /* best-effort cleanup */ }
+  schedulerOwnedTabs.delete(openedTab.id);
   return result;
 }
 
@@ -1658,6 +1668,8 @@ function validateCronExpressionInline(expr) {
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== SCHEDULER_ALARM_NAME) return;
+  if (schedulerBusy) return; // the previous alarm is still running its routines
+  schedulerBusy = true;
 
   try {
     const DB_NAME = 'clawser_checkpoints';
@@ -1776,6 +1788,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   } catch (err) {
     console.warn('[clawser] Background scheduler error:', err);
     try { db?.close(); } catch { /* best-effort */ }
+  } finally {
+    schedulerBusy = false;
   }
 });
 
@@ -2215,7 +2229,7 @@ async function findClawserTabs() {
   const custom = await getCustomOrigin();
   const tabs = await chrome.tabs.query({});
   return tabs
-    .filter((t) => typeof t.url === 'string' && isClawserUrl(t.url, custom))
+    .filter((t) => typeof t.url === 'string' && isClawserUrl(t.url, custom) && !schedulerOwnedTabs.has(t.id))
     .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))
     .slice(0, BTASK_MAX_CANDIDATE_TABS);
 }

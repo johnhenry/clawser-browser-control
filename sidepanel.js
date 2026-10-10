@@ -18,6 +18,13 @@
       min: 2,
       multiple: true,
     },
+    watch: {
+      title: 'Watch page',
+      legend: 'Open tabs (choose one)',
+      hint: 'Choose the tab to watch. In clawser you pick the section, the condition and how often to check, and see the starting text before anything is saved.',
+      min: 1,
+      multiple: false,
+    },
     extract: {
       title: 'Extract data',
       legend: 'Open tabs (choose one)',
@@ -25,6 +32,14 @@
       min: 1,
       multiple: false,
     },
+  };
+
+  const RETURN_FOCUS = { compare: 'btn-compare', extract: 'btn-extract', watch: 'btn-watch' };
+
+  const KIND_LABELS = {
+    change: 'Change detected',
+    attention: 'Needs attention',
+    run_finished: 'Run finished',
   };
 
   const STATUS_LABELS = {
@@ -122,10 +137,18 @@
     }
     const notes = res.notifications || [];
     const unread = notes.filter((n) => !n.read).length;
-    $('inbox-state').textContent = notes.length ? `${notes.length} ${notes.length === 1 ? 'message' : 'messages'}, ${unread} unread.` : 'Your inbox is empty.';
-    $('inbox-list').replaceChildren(...notes.map((n) => make('li', { class: n.read ? 'note' : 'note unread' },
-      make('span', { class: 'title', text: n.title || '(no title)' }),
-      make('span', { class: 'meta', text: [n.body, when(n.at)].filter(Boolean).join(' - ') }))));
+    const changes = notes.filter((n) => n.kind === 'change').length;
+    const attention = notes.filter((n) => n.kind === 'attention').length;
+    const parts = [`${notes.length} ${notes.length === 1 ? 'message' : 'messages'}`, `${unread} unread`];
+    if (changes) parts.push(`${changes} ${changes === 1 ? 'change' : 'changes'}`);
+    if (attention) parts.push(`${attention} needs attention`);
+    $('inbox-state').textContent = notes.length ? `${parts.join(', ')}.` : 'Your inbox is empty.';
+    $('inbox-list').replaceChildren(...notes.map((n) => {
+      const label = KIND_LABELS[n.kind];
+      return make('li', { class: n.read ? 'note' : 'note unread' },
+        make('span', { class: 'title', text: label ? `${label}: ${n.title || '(no title)'}` : (n.title || '(no title)') }),
+        make('span', { class: 'meta', text: [n.body, when(n.at)].filter(Boolean).join(' - ') }));
+    }));
   }
 
   async function refreshNotice() {
@@ -228,7 +251,7 @@
     try {
       const tabs = await chrome.tabs.query({});
       openTabs = tabs.filter((t) => typeof t.url === 'string' && /^https?:\/\//i.test(t.url) && Number.isInteger(t.id));
-      if (kind === 'extract') {
+      if (kind === 'extract' || kind === 'watch') {
         const active = openTabs.find((t) => t.active && t.lastFocusedWindow) || openTabs.find((t) => t.active);
         if (active) selected = [active.id];
       }
@@ -261,11 +284,12 @@
     renderPicker();
     say('Sending the draft to clawser...');
     const kind = mode;
+    const draftKind = kind === 'watch' ? 'monitor' : kind;
     try {
-      const r = await call('btask_draft', { kind, sources: selected.map((tabId) => ({ kind: 'tab', tabId })) });
+      const r = await call('btask_draft', { kind: draftKind, sources: selected.map((tabId) => ({ kind: 'tab', tabId })) });
       if (r.ok) {
         say(r.opened ? 'Clawser was opened and has your draft. Confirm it there to run it.' : 'Clawser has your draft. Confirm it there to run it.');
-        closePicker(kind === 'compare' ? 'btn-compare' : 'btn-extract');
+        closePicker(RETURN_FOCUS[kind]);
       } else {
         say(`The draft was not delivered: ${r.error || 'unknown error'}`);
       }
@@ -281,9 +305,8 @@
 
   $('btn-compare').addEventListener('click', () => openPicker('compare'));
   $('btn-extract').addEventListener('click', () => openPicker('extract'));
-  for (const id of ['btn-watch', 'btn-workflow']) {
-    $(id).addEventListener('click', () => say('Coming in a later release.'));
-  }
+  $('btn-watch').addEventListener('click', () => openPicker('watch'));
+  $('btn-workflow').addEventListener('click', () => say('Coming in a later release.'));
   $('btn-send').addEventListener('click', () => {
     if ($('btn-send').getAttribute('aria-disabled') === 'true') {
       const cfg = PICKERS[mode];
@@ -292,7 +315,7 @@
     }
     sendDraft();
   });
-  $('btn-cancel').addEventListener('click', () => { closePicker(mode === 'compare' ? 'btn-compare' : 'btn-extract'); say('Cancelled.'); });
+  $('btn-cancel').addEventListener('click', () => { closePicker(RETURN_FOCUS[mode]); say('Cancelled.'); });
   $('picker').addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') { ev.preventDefault(); $('btn-cancel').click(); }
   });
