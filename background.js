@@ -1726,6 +1726,10 @@ function handleNotify(msg, sender) {
 
 /** Ask a specific tab to run a routine now, and wait for its result. */
 function requestRoutineExecution(tabId, routineId, timeoutMs = ROUTINE_EXEC_TIMEOUT_MS) {
+  // The same routine must never run in two tabs at once: refuse rather than queue behind it.
+  if (pendingRoutineExecutions.has(routineId)) {
+    return Promise.resolve({ success: false, error: 'This routine is already running' });
+  }
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingRoutineExecutions.delete(routineId);
@@ -1739,6 +1743,22 @@ function requestRoutineExecution(tabId, routineId, timeoutMs = ROUTINE_EXEC_TIME
         resolve({ success: false, error: `Could not reach tab: ${e.message}` });
       });
   });
+}
+
+/**
+ * An open clawser tab on an allowed origin that announces (in its ping reply) that it hosts
+ * workspace `wsId`. Tabs that do not answer, or announce another workspace, are skipped.
+ * The scheduler's own temporary tabs are never candidates.
+ */
+async function findLiveWorkspaceTab(wsId) {
+  if (!wsId) return null;
+  let tabs;
+  try { tabs = await findClawserTabs(); } catch { return null; }
+  const answers = await Promise.all(tabs.map(async (tab) => {
+    const r = await sendToTab(tab.id, { type: 'clawser.btask.ping' }, BTASK_PING_TIMEOUT_MS);
+    return !r.transport && r.result && r.result.wsId === wsId ? tab : null;
+  }));
+  return answers.find(Boolean) || null;
 }
 
 /**
@@ -1759,6 +1779,14 @@ async function delegateRoutineExecution(routineId, timeoutMs = ROUTINE_EXEC_TIME
     } catch {
       // Tab no longer exists — fall through to (re)opening one below.
     }
+  }
+
+  // After a service-worker restart (or if the remembered tab moved on) the user may
+  // already have this workspace open: use that tab rather than opening a duplicate.
+  const live = await findLiveWorkspaceTab(lastKnownWorkspaceTab?.wsId ?? null);
+  if (live) {
+    rememberWorkspace({ tabId: live.id, url: live.url, wsId: lastKnownWorkspaceTab.wsId });
+    return requestRoutineExecution(live.id, routineId, timeoutMs);
   }
 
   if (!lastKnownWorkspaceTab?.url) {
