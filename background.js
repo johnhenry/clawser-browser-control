@@ -76,23 +76,7 @@ async function init() {
 
   // Inject content.js into already-open matching tabs
   // (manifest content_scripts only inject on page load, not retroactively)
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (!tab.url) continue;
-      const u = tab.url;
-      if (u.startsWith('http://localhost') || u.startsWith('https://localhost')
-          || u.startsWith('http://127.0.0.1') || u.startsWith('https://127.0.0.1')
-          || u.startsWith('file://')) {
-        chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          files: ['content.js'],
-        }).catch(() => {}); // ignore tabs where injection fails (e.g. chrome:// pages)
-      }
-    }
-  } catch (e) {
-    console.warn('[clawser-ext] Could not inject into existing tabs:', e);
-  }
+  await injectIntoOpenClawserTabs();
 
   console.log('[clawser-ext] Background initialized, userScripts:', userScriptsAvailable);
 }
@@ -102,6 +86,16 @@ init();
 // ── Message router ────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Messages from our own extension pages (side panel, options). These use a
+  // different `type` than the page relay, so a web page can never forge one:
+  // content.js only ever builds MARKER-typed messages.
+  if (msg && msg.type === UI_MARKER) {
+    handleUiMessage(msg, sender).then(
+      (result) => sendResponse({ result }),
+      (err) => sendResponse({ error: err?.message || String(err) }),
+    );
+    return true;
+  }
   if (!msg || msg.type !== MARKER) return false;
 
   if (msg.direction === 'notify') {
@@ -1494,11 +1488,13 @@ const pendingReadyWaiters = new Map();
 // Set up the alarm on extension install/update
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(SCHEDULER_ALARM_NAME, { periodInMinutes: 1 });
+  return setupBrowserTasks({ menus: true });
 });
 
 // Also ensure alarm exists on startup
 chrome.runtime.onStartup?.addListener(() => {
   chrome.alarms.create(SCHEDULER_ALARM_NAME, { periodInMinutes: 1 });
+  return setupBrowserTasks({ menus: false });
 });
 
 /**
@@ -1893,4 +1889,494 @@ async function actionInjectPod({ tabId }) {
     world: 'MAIN',
   });
   return { ok: true, tabId };
+}
+
+
+// ── Browser tasks: side panel, context menus, clawser origin ─────────
+//
+// The side panel (sidepanel.html), the options page and the context menus
+// all hand work to the Clawser web app; nothing here runs a task. A draft is
+// only a request for Clawser to show a draft the user must confirm.
+//
+// Transport to the Clawser tab (existing content-script bridge):
+//   background --tabs.sendMessage--> content.js --window.postMessage--> page
+//   { type: MARKER, direction: 'push', action: 'btask', id, request }
+//   page --window.postMessage--> content.js --sendResponse--> background
+//   { type: MARKER, direction: 'btask_response', id, result | error }
+// where `request` is one of the clawser.btask.draft / .list / .inbox messages.
+
+const UI_MARKER = '__clawser_ext_ui__';
+const DEFAULT_CLAWSER_ORIGIN = 'https://clawser.erisera.com';
+const CUSTOM_ORIGIN_KEY = 'clawserOrigin';
+const CUSTOM_ORIGIN_SCRIPT_ID = 'clawser-custom-origin';
+
+const BTASK_KINDS = ['extract', 'compare', 'monitor', 'workflow'];
+const BTASK_MAX_SOURCES = 20;
+const BTASK_MAX_TITLE = 200;
+const BTASK_MAX_URL = 2000;
+const BTASK_MAX_SELECTOR = 300;
+const BTASK_MAX_HINT = 120;
+const BTASK_REPLY_TIMEOUT_MS = 5000;
+const BTASK_OPEN_ATTEMPTS = 25;
+const BTASK_OPEN_RETRY_MS = 600;
+const BTASK_MAX_CANDIDATE_TABS = 5;
+
+const MENU_KINDS = new Map([
+  ['clawser-extract', 'extract'],
+  ['clawser-compare', 'compare'],
+  ['clawser-watch', 'monitor'],
+]);
+
+// ---- Origin validation ----
+// KEEP IN SYNC with normalizeClawserOrigin() in content.js (a test runs the
+// same table through both).
+
+/**
+ * Validate a user-supplied Clawser origin: an https origin only (no path,
+ * query, credentials or wildcards), with a real multi-label hostname that is
+ * not an IP literal or localhost (those are already built in).
+ * @returns {{ok: true, origin: string} | {ok: false, error: string}}
+ */
+function normalizeClawserOrigin(input) {
+  const fail = (error) => ({ ok: false, error });
+  if (typeof input !== 'string') return fail('Enter an https origin such as https://clawser.example.com');
+  const raw = input.trim();
+  if (!raw) return fail('Enter an https origin such as https://clawser.example.com');
+  if (raw.length > 200) return fail('That origin is too long');
+  if (/[\s*<>"'\\^`{|}?#]/.test(raw)) return fail('Use a plain origin: no spaces, wildcards, path, query or fragment');
+  let u;
+  try { u = new URL(raw); } catch { return fail('That is not a valid URL'); }
+  if (u.protocol !== 'https:') return fail('The origin must use https');
+  if (u.username || u.password) return fail('The origin must not contain a username or password');
+  if (u.pathname !== '/') return fail('Use only the origin, without a path');
+  const host = u.hostname;
+  if (!host || host.endsWith('.') || !host.includes('.')) return fail('Enter a full hostname such as clawser.example.com');
+  if (/^[\d.]+$/.test(host) || host.startsWith('[')) return fail('IP addresses are not allowed here');
+  if (host === 'localhost' || host.endsWith('.localhost')) return fail('localhost is already allowed by default');
+  if (u.origin === DEFAULT_CLAWSER_ORIGIN) return fail('That origin is already allowed by default');
+  return { ok: true, origin: u.origin };
+}
+
+/** Is this tab URL a Clawser page (built-in origins, or the configured custom origin)? */
+function isClawserUrl(url, customOrigin) {
+  let u;
+  try { u = new URL(url); } catch { return false; }
+  if (u.protocol === 'file:') return true;
+  if ((u.protocol === 'http:' || u.protocol === 'https:') && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) return true;
+  if (u.protocol === 'https:') return u.origin === DEFAULT_CLAWSER_ORIGIN || (!!customOrigin && u.origin === customOrigin);
+  return false;
+}
+
+/** The validated custom origin from storage, or null. A corrupt value counts as unset. */
+async function getCustomOrigin() {
+  try {
+    const stored = await chrome.storage.local.get(CUSTOM_ORIGIN_KEY);
+    const r = normalizeClawserOrigin(stored?.[CUSTOM_ORIGIN_KEY]);
+    return r.ok ? r.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+// Serialises origin changes so storage and the registered content script can
+// never end up describing different origins.
+let originChain = Promise.resolve();
+
+function runOriginJob(fn) {
+  const run = originChain.then(fn, fn);
+  originChain = run.catch(() => {});
+  return run;
+}
+
+/** Make the registered dynamic content script match `origin` (or nothing). */
+async function applyOriginRegistration(origin) {
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [CUSTOM_ORIGIN_SCRIPT_ID] });
+  } catch { /* not registered yet */ }
+  if (!origin) return;
+  await chrome.scripting.registerContentScripts([{
+    id: CUSTOM_ORIGIN_SCRIPT_ID,
+    matches: [`${origin}/*`],
+    js: ['content.js'],
+    runAt: 'document_idle',
+    persistAcrossSessions: true,
+  }]);
+}
+
+async function injectIntoOpenClawserTabs() {
+  try {
+    const custom = await getCustomOrigin();
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (!tab.url || !isClawserUrl(tab.url, custom)) continue;
+      chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] })
+        .catch(() => {}); // ignore tabs where injection fails
+    }
+  } catch (e) {
+    console.warn('[clawser-ext] Could not inject into existing tabs:', e);
+  }
+}
+
+async function setClawserOrigin(input) {
+  const wantsReset = typeof input === 'string' && input.trim() === '';
+  let checked = null;
+  if (!wantsReset) {
+    checked = normalizeClawserOrigin(input);
+    if (!checked.ok) return { ok: false, error: checked.error };
+  }
+  const origin = checked ? checked.origin : null;
+  await runOriginJob(async () => {
+    if (origin) await chrome.storage.local.set({ [CUSTOM_ORIGIN_KEY]: origin });
+    else await chrome.storage.local.remove(CUSTOM_ORIGIN_KEY);
+    await applyOriginRegistration(origin);
+  });
+  if (origin) await injectIntoOpenClawserTabs();
+  return { ok: true, origin };
+}
+
+// ---- Setup (install / startup) ----
+
+async function setupBrowserTasks({ menus }) {
+  try {
+    await runOriginJob(async () => applyOriginRegistration(await getCustomOrigin()));
+  } catch (e) {
+    console.warn('[clawser-ext] Could not sync custom Clawser origin:', e);
+  }
+  try {
+    await chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true });
+  } catch { /* side panel not supported here */ }
+  if (menus) await createContextMenus();
+}
+
+async function createContextMenus() {
+  if (!chrome.contextMenus) return;
+  try {
+    await chrome.contextMenus.removeAll();
+    const contexts = ['page', 'selection', 'link', 'image', 'video', 'audio', 'frame'];
+    chrome.contextMenus.create({ id: 'clawser-extract', title: 'Extract data from this section', contexts });
+    chrome.contextMenus.create({ id: 'clawser-compare', title: 'Compare with other tabs', contexts });
+    chrome.contextMenus.create({ id: 'clawser-watch', title: 'Watch this section', contexts });
+  } catch (e) {
+    console.warn('[clawser-ext] Could not create context menus:', e);
+  }
+}
+
+// ---- Helpers ----
+
+function clampText(value, max) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+/** http(s) URL with credentials stripped, or null. */
+function safeHttpUrl(value) {
+  if (typeof value !== 'string' || value.length > BTASK_MAX_URL * 2) return null;
+  let u;
+  try { u = new URL(value); } catch { return null; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  u.username = '';
+  u.password = '';
+  const href = u.href;
+  return href.length <= BTASK_MAX_URL ? href : null;
+}
+
+/** Only an extension page of this extension may drive the btask/origin actions. */
+function isOwnExtensionPage(sender) {
+  try {
+    return !!sender && !!chrome.runtime.id && sender.id === chrome.runtime.id
+      && typeof sender.url === 'string' && sender.url.startsWith(chrome.runtime.getURL(''));
+  } catch {
+    return false;
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---- UI message router ----
+
+async function handleUiMessage(msg, sender) {
+  if (!isOwnExtensionPage(sender)) throw new Error('Not allowed from this context');
+  switch (msg.action) {
+    case 'get_clawser_origin':
+      return { origin: await getCustomOrigin(), defaultOrigin: DEFAULT_CLAWSER_ORIGIN };
+    case 'set_clawser_origin':
+      return setClawserOrigin(msg.origin);
+    case 'btask_list':
+      return btaskFetch('clawser.btask.list', 'definitions', normalizeDefinitions);
+    case 'btask_inbox':
+      return btaskFetch('clawser.btask.inbox', 'notifications', normalizeNotifications);
+    case 'btask_draft':
+      return btaskDraftFromPanel(msg);
+    case 'btask_open':
+      return btaskOpenClawser();
+    default:
+      throw new Error(`Unknown action: ${msg.action}`);
+  }
+}
+
+// ---- Talking to the Clawser tab ----
+
+let deliveryChain = Promise.resolve();
+
+/** Draft deliveries run one at a time so two quick clicks cannot open two Clawser tabs. */
+function serializedDelivery(fn) {
+  const run = deliveryChain.then(fn, fn);
+  deliveryChain = run.catch(() => {});
+  return run;
+}
+
+/**
+ * Ask one tab. Returns { transport: true } when nothing there answered
+ * (no content script, no receiver yet, timeout), { error } when the page
+ * answered with an error, { result } otherwise.
+ */
+async function askClawserTab(tabId, request) {
+  let resp;
+  try {
+    resp = await chrome.tabs.sendMessage(tabId, {
+      type: MARKER, direction: 'btask_request', request, timeoutMs: BTASK_REPLY_TIMEOUT_MS,
+    });
+  } catch {
+    return { transport: true };
+  }
+  if (!resp || resp.transportError) return { transport: true };
+  if (resp.error) return { error: clampText(String(resp.error), 300) };
+  return { result: resp.result };
+}
+
+async function findClawserTabs() {
+  const custom = await getCustomOrigin();
+  const tabs = await chrome.tabs.query({});
+  return tabs
+    .filter((t) => typeof t.url === 'string' && isClawserUrl(t.url, custom))
+    .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))
+    .slice(0, BTASK_MAX_CANDIDATE_TABS);
+}
+
+/**
+ * Deliver a request to a connected Clawser tab. With `open`, opens Clawser
+ * (configured origin, else production) when none answers and retries until
+ * the new page acknowledges.
+ */
+async function deliverToClawser(request, { open }) {
+  for (const tab of await findClawserTabs()) {
+    const r = await askClawserTab(tab.id, request);
+    if (!r.transport) return { connected: true, tabId: tab.id, ...r };
+  }
+  if (!open) return { connected: false };
+
+  const custom = await getCustomOrigin();
+  const tab = await chrome.tabs.create({ url: `${custom || DEFAULT_CLAWSER_ORIGIN}/`, active: true });
+  for (let i = 0; i < BTASK_OPEN_ATTEMPTS; i++) {
+    await sleep(BTASK_OPEN_RETRY_MS);
+    const r = await askClawserTab(tab.id, request);
+    if (!r.transport) return { connected: true, opened: true, tabId: tab.id, ...r };
+    try { await chrome.tabs.get(tab.id); } catch { break; } // user closed it
+  }
+  return { connected: false, opened: true };
+}
+
+async function focusTab(tabId) {
+  try {
+    const t = await chrome.tabs.update(tabId, { active: true });
+    if (t && t.windowId !== undefined) await chrome.windows.update(t.windowId, { focused: true });
+  } catch { /* focus is best-effort */ }
+}
+
+/** Send a validated draft to Clawser and bring that tab forward. */
+async function sendDraft({ kind, sources, origin }) {
+  const request = { type: 'clawser.btask.draft', kind, sources, origin };
+  const r = await serializedDelivery(() => deliverToClawser(request, { open: true }));
+  if (!r.connected) return { ok: false, opened: !!r.opened, error: 'Clawser did not respond. Open clawser and try again.' };
+  if (r.error) return { ok: false, error: r.error };
+  await focusTab(r.tabId);
+  return { ok: true, opened: !!r.opened };
+}
+
+async function btaskDraftFromPanel(msg) {
+  if (!BTASK_KINDS.includes(msg.kind)) throw new Error('Unknown task kind');
+  const raw = msg.sources;
+  if (!Array.isArray(raw) || raw.length < 1) throw new Error('Choose at least one tab');
+  if (raw.length > BTASK_MAX_SOURCES) throw new Error(`At most ${BTASK_MAX_SOURCES} sources`);
+  const sources = [];
+  for (const item of raw) {
+    const tabId = item?.tabId;
+    if (!Number.isInteger(tabId) || tabId < 0) throw new Error('Invalid tab');
+    let tab;
+    try { tab = await chrome.tabs.get(tabId); } catch { throw new Error('A selected tab is no longer open'); }
+    const url = safeHttpUrl(tab?.url);
+    if (!url) throw new Error('Only http and https pages can be used');
+    sources.push({ kind: 'tab', url, title: clampText(tab.title, BTASK_MAX_TITLE), tabId, capturedAt: new Date().toISOString() });
+  }
+  // The origin is decided here, never taken from the caller.
+  return sendDraft({ kind: msg.kind, sources, origin: 'sidepanel' });
+}
+
+/** Bring a Clawser tab forward, opening Clawser if none is open. */
+async function btaskOpenClawser() {
+  return serializedDelivery(async () => {
+    const [existing] = await findClawserTabs();
+    if (existing) { await focusTab(existing.id); return { ok: true, opened: false }; }
+    const custom = await getCustomOrigin();
+    await chrome.tabs.create({ url: `${custom || DEFAULT_CLAWSER_ORIGIN}/`, active: true });
+    return { ok: true, opened: true };
+  });
+}
+
+function normalizeDefinitions(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, 100).map((d) => {
+    const lr = d?.lastRun;
+    return {
+      id: clampText(String(d?.id ?? ''), 100),
+      kind: clampText(String(d?.kind ?? ''), 20),
+      name: clampText(String(d?.name ?? ''), 200),
+      updatedAt: clampText(String(d?.updatedAt ?? ''), 40),
+      lastRun: lr && typeof lr === 'object'
+        ? { id: clampText(String(lr.id ?? ''), 100), status: clampText(String(lr.status ?? ''), 40), finishedAt: lr.finishedAt == null ? null : clampText(String(lr.finishedAt), 40) }
+        : null,
+    };
+  }).filter((d) => d.id);
+}
+
+function normalizeNotifications(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, 50).map((n) => {
+    const out = {
+      id: clampText(String(n?.id ?? ''), 100),
+      kind: clampText(String(n?.kind ?? ''), 20),
+      at: clampText(String(n?.at ?? ''), 40),
+      title: clampText(String(n?.title ?? ''), 200),
+      body: clampText(String(n?.body ?? ''), 500),
+      read: n?.read === true,
+    };
+    if (n?.runId) out.runId = clampText(String(n.runId), 100);
+    if (n?.definitionId) out.definitionId = clampText(String(n.definitionId), 100);
+    return out;
+  }).filter((n) => n.id);
+}
+
+/** list / inbox: read-only, never opens or focuses anything. */
+async function btaskFetch(type, field, normalize) {
+  const r = await deliverToClawser({ type }, { open: false });
+  if (!r.connected) return { connected: false };
+  if (r.error) return { connected: true, error: r.error };
+  return { connected: true, [field]: normalize(r.result?.[field]) };
+}
+
+// ---- Context menus ----
+
+chrome.contextMenus?.onClicked.addListener((info, tab) => {
+  return handleMenuClick(info, tab).catch((e) => console.warn('[clawser-ext] Context-menu action failed:', e));
+});
+
+async function handleMenuClick(info, tab) {
+  const id = info?.menuItemId;
+  if (typeof id !== 'string' || !MENU_KINDS.has(id)) return;
+  const kind = MENU_KINDS.get(id);
+  const url = safeHttpUrl(tab?.url);
+  if (!url || !Number.isInteger(tab.id)) return;
+
+  const selected = typeof info.selectionText === 'string' ? clampText(info.selectionText, 500) : '';
+  // Compare takes the whole tab unless the user selected something.
+  const wantSection = kind !== 'compare' || selected !== '';
+  const section = wantSection ? await captureSection(tab.id, info, selected) : null;
+
+  const source = { kind: section ? 'section' : 'tab', url, title: clampText(tab.title, BTASK_MAX_TITLE), tabId: tab.id, capturedAt: new Date().toISOString() };
+  if (section) source.section = section;
+  const r = await sendDraft({ kind, sources: [source], origin: 'contextmenu' });
+  if (!r.ok) console.warn('[clawser-ext] Draft not delivered:', r.error);
+}
+
+/**
+ * Capture a stable selector and a short text hint for the clicked element, in
+ * the top frame only (a selector from a sub-frame would not resolve against the
+ * tab's URL). Everything the page returns is untrusted: re-validated here.
+ */
+async function captureSection(tabId, info, selectedText) {
+  if (Number.isInteger(info.frameId) && info.frameId > 0) return null;
+  let res;
+  try {
+    res = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: captureSectionInPage,
+      args: [Number.isInteger(info.targetElementId) ? info.targetElementId : null, selectedText],
+    });
+  } catch {
+    return null;
+  }
+  const out = res?.[0]?.result;
+  if (!out || typeof out !== 'object') return null;
+  const selector = out.selector;
+  if (typeof selector !== 'string' || selector.length < 1 || selector.length > BTASK_MAX_SELECTOR || /[\u0000-\u001f\u007f]/.test(selector)) return null;
+  return { selector, textHint: clampText(out.textHint, BTASK_MAX_HINT) };
+}
+
+/**
+ * Runs IN THE PAGE (serialised by chrome.scripting.executeScript, so it must
+ * stay self-contained). Finds the right-clicked element and returns a short
+ * unique selector plus a bounded text hint. Never reads form-control values.
+ * @returns {{selector: string|null, textHint: string}}
+ */
+function captureSectionInPage(targetElementId, selectionText) {
+  const MAX_SELECTOR = 300;
+  const MAX_HINT = 120;
+  const MAX_DEPTH = 12;
+  const flat = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, MAX_HINT);
+
+  let el = null;
+  try {
+    const getTarget = (chrome.menus && chrome.menus.getTargetElement) || (chrome.contextMenus && chrome.contextMenus.getTargetElement);
+    if (targetElementId != null && getTarget) el = getTarget.call(chrome.menus && chrome.menus.getTargetElement ? chrome.menus : chrome.contextMenus, targetElementId);
+  } catch (e) { el = null; }
+  if (!el) {
+    try {
+      const sel = window.getSelection();
+      const n = sel && sel.anchorNode;
+      if (n) el = n.nodeType === 1 ? n : n.parentElement;
+    } catch (e) { el = null; }
+  }
+  if (!el || el.nodeType !== 1) return { selector: null, textHint: flat(selectionText) };
+
+  const isForm = /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || el.isContentEditable === true;
+  let hint = '';
+  if (!isForm) hint = flat(selectionText) || flat(String(el.textContent || '').slice(0, 2000));
+
+  const esc = (s) => (typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(s) : String(s).replace(/[^a-zA-Z0-9_-]/g, '\\$&'));
+  const unique = (sel, node) => {
+    try { const m = document.querySelectorAll(sel); return m.length === 1 && m[0] === node; } catch (e) { return false; }
+  };
+  const unstableId = (id) => !id || id.length > 64 || /\d{4,}/.test(id) || id.indexOf(':') !== -1 || /^[a-f0-9-]{20,}$/i.test(id);
+  const anchorFor = (node) => {
+    if (!unstableId(node.id)) {
+      const s = '#' + esc(node.id);
+      if (unique(s, node)) return s;
+    }
+    const tid = node.getAttribute && node.getAttribute('data-testid');
+    if (tid && tid.length <= 64 && !/["\\\n\r]/.test(tid)) {
+      const s = '[data-testid="' + tid + '"]';
+      if (unique(s, node)) return s;
+    }
+    return null;
+  };
+
+  const segs = [];
+  let anchor = null;
+  let node = el;
+  for (let depth = 0; node && node.nodeType === 1 && depth <= MAX_DEPTH; depth++) {
+    anchor = anchorFor(node);
+    if (anchor) break;
+    const tag = String(node.tagName).toLowerCase();
+    if (tag === 'body') { anchor = 'body'; break; }
+    if (tag === 'html' || !/^[a-z][a-z0-9-]*$/.test(tag) || !node.parentElement) break;
+    const sameTag = Array.prototype.filter.call(node.parentElement.children, (c) => c.tagName === node.tagName);
+    segs.unshift(tag + ':nth-of-type(' + (sameTag.indexOf(node) + 1) + ')');
+    node = node.parentElement;
+  }
+  let selector = null;
+  if (anchor) {
+    const candidate = [anchor].concat(segs).join(' > ');
+    if (candidate.length <= MAX_SELECTOR && unique(candidate, el)) selector = candidate;
+  }
+  return { selector, textHint: hint };
 }

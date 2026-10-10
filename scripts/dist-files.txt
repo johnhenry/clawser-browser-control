@@ -6,3 +6,8 @@ gifenc.js
 offscreen.html
 offscreen.js
 icons
+sidepanel.html
+sidepanel.js
+sidepanel.css
+options.html
+options.js

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clawser browser tasks</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <main>
+    <h1>Clawser browser tasks</h1>
+
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+
+    <section aria-labelledby="start-h">
+      <h2 id="start-h">Start a task</h2>
+      <p class="hint">Each action prepares a draft in clawser. Nothing runs until you confirm it there.</p>
+      <ul class="actions">
+        <li>
+          <button type="button" id="btn-compare" aria-describedby="d-compare">Compare tabs</button>
+          <span id="d-compare" class="desc">Line up facts from several open tabs side by side.</span>
+        </li>
+        <li>
+          <button type="button" id="btn-extract" aria-describedby="d-extract">Extract data</button>
+          <span id="d-extract" class="desc">Turn a table or list on one tab into structured data.</span>
+        </li>
+        <li>
+          <button type="button" id="btn-watch" aria-disabled="true" aria-describedby="d-watch">Watch page</button>
+          <span id="d-watch" class="desc">Coming in a later release.</span>
+        </li>
+        <li>
+          <button type="button" id="btn-workflow" aria-disabled="true" aria-describedby="d-workflow">Create workflow</button>
+          <span id="d-workflow" class="desc">Coming in a later release.</span>
+        </li>
+      </ul>
+    </section>
+
+    <section id="picker" aria-labelledby="picker-title" hidden>
+      <h2 id="picker-title" tabindex="-1">Choose tabs</h2>
+      <p id="picker-hint" class="hint"></p>
+      <fieldset>
+        <legend id="picker-legend">Open tabs</legend>
+        <ul id="tab-options" class="plain"></ul>
+        <p id="tab-options-empty" class="hint" hidden>No http or https tabs are open.</p>
+      </fieldset>
+      <h3 id="selected-h">Selected tabs</h3>
+      <p id="selected-count" class="hint"></p>
+      <ol id="selected-list" aria-labelledby="selected-h"></ol>
+      <div class="row">
+        <button type="button" id="btn-send">Send draft to clawser</button>
+        <button type="button" id="btn-cancel">Cancel</button>
+      </div>
+    </section>
+
+    <section aria-labelledby="tasks-h">
+      <div class="row between">
+        <h2 id="tasks-h">Your tasks</h2>
+        <button type="button" id="btn-refresh">Refresh</button>
+      </div>
+      <p id="tasks-state" class="hint"></p>
+      <button type="button" id="btn-open-clawser" hidden>Open clawser</button>
+      <ul id="task-list" class="plain" aria-labelledby="tasks-h"></ul>
+    </section>
+
+    <section aria-labelledby="last-h">
+      <h2 id="last-h">Last run</h2>
+      <p id="last-run" class="hint"></p>
+    </section>
+
+    <section aria-labelledby="inbox-h">
+      <h2 id="inbox-h">Inbox</h2>
+      <p id="inbox-state" class="hint"></p>
+      <ul id="inbox-list" class="plain" aria-labelledby="inbox-h"></ul>
+    </section>
+  </main>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

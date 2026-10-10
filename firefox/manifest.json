@@ -19,9 +19,15 @@
     "webRequest",
     "cookies",
     "storage",
-    "alarms"
+    "alarms",
+    "contextMenus"
   ],
   "host_permissions": ["<all_urls>"],
+
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
 
   "background": {
     "scripts": ["background.js"]
@@ -34,7 +40,8 @@
         "https://localhost/*",
         "http://127.0.0.1/*",
         "https://127.0.0.1/*",
-        "file:///*"
+        "file:///*",
+        "https://clawser.erisera.com/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
@@ -49,7 +56,8 @@
         "https://localhost/*",
         "http://127.0.0.1/*",
         "https://127.0.0.1/*",
-        "file:///*"
+        "file:///*",
+        "https://clawser.erisera.com/*"
       ]
     }
   ],

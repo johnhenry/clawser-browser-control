@@ -23,10 +23,26 @@ Chrome extension that gives the [Clawser](https://github.com/johnhenry/clawser) 
 - `content.js` — content script injected into matching pages, relaying page <-> extension RPC
 - `pod-inject.js` — web-accessible script, injected into the page's MAIN world via `chrome.scripting.executeScript`, that boots an `InjectedPod` for page-side text/structured-data extraction, a visual overlay indicator, and BroadcastChannel peer discovery. It relays page-originated Pod messages up to the extension via `InjectedPod`'s `extensionBridge` constructor option: the boot wrapper (defined in `scripts/build-pod-inject.mjs`'s `BOOT_SECTION`, not the bundled npm package source) constructs a bridge whose `postMessage()` reuses `content.js`'s existing page → background `notify` relay (`window.postMessage({ type: '__clawser_ext__', direction: 'notify', action: 'pod_message', params: { msg } }, '*')`), which `content.js` forwards to `background.js` after checking its own origin allowlist. Generated from the `browsermesh-pod`/`browsermesh-primitives` npm packages by `scripts/build-pod-inject.mjs` (`npm run build:pod-inject`) — do not edit directly; bump the pinned versions in `package.json` and regenerate instead.
 - WebMCP tab tools (`background.js`: `actionWebmcpListTools` / `actionWebmcpCallTool`) — there is deliberately **no content script on arbitrary pages**. When Clawser asks, the service worker injects a small function into the MAIN world of the requested tab(s) (`chrome.scripting.executeScript`, the same mechanism as `webmcp_discover`) that reads `document.modelContext.getTools()` or runs `executeTool(tool, jsonString)` (also `navigator.modelContextTesting` for older Chrome previews). Listing covers every open http(s) tab (capped at 50, 100 tools each). Calling requires the `expectedOrigin` the tool was listed on and refuses if the tab has since navigated elsewhere; arguments, results, descriptions and schemas are size-clamped; a page's `readOnlyHint` is dropped (only `destructiveHint` is forwarded) because a page's claim about itself is not evidence; each call is written to the audit log (tool name and origin only, never arguments or results). Capability name: `webmcp_tabs`. Approval of each call is Clawser's job (mcp-gate policy and its approval dialog), not the extension's.
+- `sidepanel.html` / `sidepanel.js` / `sidepanel.css` — browser-tasks side panel (Chrome). Four entry actions (Compare tabs, Extract data, Watch page and Create workflow; the last two say "Coming in a later release"), an explicit tab picker, and the shared task list, inbox and last-run status. The list and inbox are read from a connected Clawser tab with `{type:"clawser.btask.list"}` / `{type:"clawser.btask.inbox"}`; with no Clawser tab connected it says "Open clawser to see your tasks" and shows nothing else. It never runs a task: it hands Clawser a `clawser.btask.draft` message, which Clawser shows as a draft for the user to confirm.
+- Context menus (`background.js`) — "Extract data from this section", "Compare with other tabs", "Watch this section". For a section, the service worker runs a small function in the clicked page (on demand, via `chrome.scripting`, top frame only) that returns a short unique selector and a text hint of at most 120 characters (never form-field values). The result is treated as untrusted and re-validated before it is sent.
+- `options.html` / `options.js` — options page for the one extra Clawser origin (see below).
 - `gifenc.js` — vendored GIF encoder (see THIRD-PARTY-LICENSES.md), used for GIF recording
 - `offscreen.html` / `offscreen.js` — Chrome-only offscreen document that decodes captured frames and encodes them into a GIF (a service worker has no DOM/canvas to do this itself); Firefox's MV3 background page keeps DOM access, so it encodes inline instead
 - `manifest.json` — Chrome MV3 manifest (minimum Chrome 135)
 - `firefox/manifest.json` — Firefox MV3 manifest (minimum Firefox 128)
+
+## Permissions
+
+Beyond the permissions used for browser control (`tabs`, `activeTab`, `scripting`, `userScripts`, `webRequest`, `cookies`, `storage`, `alarms`, `offscreen`, host access), the browser-tasks feature adds two:
+
+- `sidePanel` — shows the browser-tasks panel (launcher, task list, inbox, last run) next to the page. The toolbar button opens it.
+- `contextMenus` — adds the three right-click entries that start a draft from the page or section you clicked.
+
+Neither grants access to page content by itself. Nothing is read from a page except when you choose a context-menu entry or send a draft, and a draft is only a message to your Clawser tab: Clawser shows it and nothing runs until you confirm there.
+
+### Clawser origin
+
+The content script (the bridge between Clawser and the extension) runs only on `http(s)://localhost`, `http(s)://127.0.0.1`, `file://` and `https://clawser.erisera.com`. If you host Clawser elsewhere, set one additional **https origin** on the extension's options page. It must be a plain origin (no path, wildcard, credentials or IP address). The service worker validates it, stores it in `chrome.storage.local`, and registers `content.js` for exactly that origin; `content.js` re-checks `location.origin` itself before relaying anything. Only extension pages (the options page and the side panel) can change it; a web page cannot.
 
 ## Development
 

@@ -34,6 +34,14 @@ alarms
 ------
 Required to periodically check whether a scheduled Clawser routine is due to run, so routines can still fire on a schedule even when no Clawser tab is currently open.
 
+sidePanel
+---------
+Required to show the Clawser browser-tasks panel beside the page: four task launchers, a picker for the open tabs the user chooses, and the user's saved tasks, inbox and last-run status, which are read from their own Clawser tab. The panel only prepares drafts; nothing runs until the user confirms in Clawser.
+
+contextMenus
+------------
+Required to add the right-click entries "Extract data from this section", "Compare with other tabs" and "Watch this section". When the user picks one, the extension records a selector and a short text hint for the clicked element and sends it to the user's Clawser tab as a draft. Nothing is read in the background and nothing runs until the user confirms in Clawser.
+
 debugger (optional)
 -------------------
 Reserved for a future advanced browser-inspection feature (Chrome DevTools Protocol access for detailed page debugging). Not currently used by any action — declared as optional so it can be requested with explicit user consent if that feature ships.
@@ -60,6 +68,7 @@ This extension bridges your local Clawser workspace with full browser capabiliti
 • Input Simulation — Click buttons, fill forms, type text, and scroll pages
 • Network Monitoring — Observe request metadata (URL, method, status, type) for debugging
 • Cookie Access — Relay authentication state for working with logged-in sites
+• Browser Tasks — A side panel and right-click menu to start comparing tabs or extracting data; each one prepares a draft in Clawser that you confirm before anything runs
 
 How it works:
 1. Run the Clawser workspace locally (localhost)

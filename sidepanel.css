@@ -1,0 +1,63 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #4a4a4a;
+  --line: #8a8a8a;
+  --accent: #0b57d0;
+  --accent-fg: #ffffff;
+  --focus: #b45309;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1b1d;
+    --fg: #f1f1f1;
+    --muted: #c4c4c4;
+    --line: #8d8d92;
+    --accent: #8ab4f8;
+    --accent-fg: #101010;
+    --focus: #fbbf24;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.45 system-ui, sans-serif;
+}
+main { padding: 12px 14px 24px; }
+h1 { font-size: 17px; margin: 0 0 8px; }
+h2 { font-size: 15px; margin: 18px 0 6px; }
+h3 { font-size: 14px; margin: 12px 0 4px; }
+.hint, .desc { color: var(--muted); margin: 4px 0; }
+.desc { display: block; font-size: 13px; }
+.status { min-height: 1.4em; margin: 4px 0; font-weight: 600; }
+.status:empty { min-height: 0; }
+ul.plain, ol { padding-left: 0; list-style: none; margin: 6px 0; }
+ol { list-style: decimal inside; }
+.actions { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 8px; }
+.actions li { border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.row.between { justify-content: space-between; }
+button {
+  font: inherit;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+button#btn-send { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+button[aria-disabled="true"], button:disabled { cursor: not-allowed; border-style: dashed; opacity: 0.8; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 8px 0; padding: 6px 8px; max-height: 40vh; overflow: auto; }
+legend { padding: 0 4px; }
+.tab-label { display: block; padding: 4px 0; word-break: break-word; }
+.tab-label .t { font-weight: 600; }
+.tab-label .u { display: block; color: var(--muted); font-size: 12px; }
+li.task, li.note { border-top: 1px solid var(--line); padding: 6px 0; word-break: break-word; }
+li.note.unread .title::before { content: "Unread: "; font-weight: 600; }
+.meta { color: var(--muted); font-size: 12px; display: block; }
+[hidden] { display: none !important; }
