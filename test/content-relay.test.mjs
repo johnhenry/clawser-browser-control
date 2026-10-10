@@ -139,11 +139,11 @@ describe('content.js — origin allowlist (defense in depth)', () => {
     { href: 'http://127.0.0.1:8080/workspace', protocol: 'http:', hostname: '127.0.0.1' },
     { href: 'https://127.0.0.1/workspace', protocol: 'https:', hostname: '127.0.0.1' },
     { href: 'file:///Users/x/clawser/index.html', protocol: 'file:', hostname: '' },
+    { href: 'https://clawser.erisera.com/', protocol: 'https:', hostname: 'clawser.erisera.com', origin: 'https://clawser.erisera.com' },
   ];
 
   const BLOCKED_LOCATIONS = [
     { href: 'https://example.com/workspace', protocol: 'https:', hostname: 'example.com' },
-    { href: 'https://clawser.erisera.com/', protocol: 'https:', hostname: 'clawser.erisera.com' },
     { href: 'https://evil.localhost.attacker.com/', protocol: 'https:', hostname: 'evil.localhost.attacker.com' },
     { href: 'https://localhost.attacker.com/', protocol: 'https:', hostname: 'localhost.attacker.com' },
   ];

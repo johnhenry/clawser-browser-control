@@ -38,16 +38,25 @@ function shallowMergeOneLevel(base, override) {
  * @param {Function} [opts.fetchImpl] - stub for the global fetch() used by
  *   actionCorsFetch/actionWebmcpDiscover — defaults to one that rejects,
  *   since most tests shouldn't make real network calls.
+ * @param {Function} [opts.setTimeoutImpl] - replaces the sandbox's setTimeout (e.g. to shrink retry delays)
  * @returns {{send: Function, notify: Function, fireAlarm: Function, chrome: object, sandbox: object}}
  */
 export function loadBackground(chromeOverrides = {}, opts = {}) {
-  const hooks = { listener: null, alarmListener: null };
+  const hooks = { listener: null, alarmListener: null, installedListener: null, startupListener: null, menuListener: null };
+  const menusCreated = []; // chrome.contextMenus.create() props, in order
+  const registered = []; // chrome.scripting.registerContentScripts() entries currently registered
+  const localStore = { ...(opts.storage || {}) }; // chrome.storage.local backing object
+  const sessionStore = {}; // chrome.storage.session backing object
+  const badge = { text: '', title: '' }; // chrome.action state
+  const panelBehavior = []; // chrome.sidePanel.setPanelBehavior() args
 
   const defaultChrome = {
     runtime: {
+      id: 'ext-id',
+      getURL: (p = '') => `chrome-extension://ext-id/${p}`,
       onMessage: { addListener: (fn) => { hooks.listener = fn; } },
-      onInstalled: { addListener: () => {} },
-      onStartup: { addListener: () => {} },
+      onInstalled: { addListener: (fn) => { hooks.installedListener = fn; } },
+      onStartup: { addListener: (fn) => { hooks.startupListener = fn; } },
       sendMessage: async () => ({}),
       getContexts: async () => [],
     },
@@ -70,10 +79,42 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
     },
     windows: { update: async () => ({ id: 1, width: 100, height: 100 }) },
     scripting: {
+      registerContentScripts: async (list) => { registered.push(...list); },
+      unregisterContentScripts: async ({ ids } = {}) => {
+        const before = registered.length;
+        for (let i = registered.length - 1; i >= 0; i--) if (!ids || ids.includes(registered[i].id)) registered.splice(i, 1);
+        if (ids && before === registered.length) throw new Error('Nonexistent script ID');
+      },
       executeScript: async ({ func, args }) => [{ result: func ? func(...(args || [])) : null }],
     },
     webRequest: { onCompleted: { addListener: () => {} } },
     cookies: { getAll: async () => [] },
+    contextMenus: {
+      create: (props) => { menusCreated.push(props); return props.id; },
+      removeAll: async () => { menusCreated.length = 0; },
+      onClicked: { addListener: (fn) => { hooks.menuListener = fn; } },
+    },
+    storage: {
+      local: {
+        get: async (keys) => {
+          const out = {};
+          for (const k of [].concat(keys ?? Object.keys(localStore))) if (k in localStore) out[k] = localStore[k];
+          return out;
+        },
+        set: async (obj) => { Object.assign(localStore, obj); },
+        remove: async (keys) => { for (const k of [].concat(keys)) delete localStore[k]; },
+      },
+      session: {
+        get: async (k) => { const o = {}; for (const key of [].concat(k)) if (key in sessionStore) o[key] = sessionStore[key]; return o; },
+        set: async (obj) => { Object.assign(sessionStore, obj); },
+        remove: async (k) => { for (const key of [].concat(k)) delete sessionStore[key]; },
+      },
+    },
+    action: {
+      setBadgeText: async ({ text }) => { badge.text = text; },
+      setTitle: async ({ title }) => { badge.title = title; },
+    },
+    sidePanel: { setPanelBehavior: async (b) => { panelBehavior.push(b); } },
     userScripts: undefined,
     offscreen: undefined,
   };
@@ -125,7 +166,7 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
     indexedDB: fakeIndexedDB,
     URL,
     fetch: fetchImpl,
-    setTimeout,
+    setTimeout: opts.setTimeoutImpl || setTimeout,
     clearTimeout,
     setInterval,
     clearInterval,
@@ -154,5 +195,19 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
     return hooks.alarmListener({ name: 'clawser-scheduler' });
   }
 
-  return { sandbox, send, notify, fireAlarm, chrome: chromeStub, idbStore };
+  /** Simulate a message from an extension page (side panel / options). */
+  function sendUi(msg, sender = { id: 'ext-id', url: 'chrome-extension://ext-id/sidepanel.html' }) {
+    return new Promise((resolve) => {
+      const r = hooks.listener({ type: '__clawser_ext_ui__', ...msg }, sender, resolve);
+      if (r !== true) resolve(undefined); // listener declined (no async response)
+    });
+  }
+
+  /** Fire runtime.onInstalled. */
+  function install() { return hooks.installedListener?.({ reason: 'install' }); }
+
+  /** Simulate a context-menu click. */
+  function clickMenu(info, tab) { return hooks.menuListener?.(info, tab); }
+
+  return { sandbox, send, sendUi, install, clickMenu, notify, fireAlarm, chrome: chromeStub, idbStore, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
 }

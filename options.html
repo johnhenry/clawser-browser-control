@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clawser Browser Control options</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <main>
+    <h1>Clawser Browser Control options</h1>
+
+    <form id="origin-form" novalidate>
+      <h2 id="origin-h">Clawser web app origin</h2>
+      <p class="hint" id="origin-help">
+        The extension connects to Clawser on <code>localhost</code>, <code>127.0.0.1</code>, local files, and
+        <code>https://clawser.erisera.com</code> by default. If you host Clawser somewhere else, enter its
+        https origin here (for example <code>https://clawser.example.com</code>), with no path. Only this one
+        extra origin is allowed.
+      </p>
+      <p>
+        <label for="origin">Custom https origin (optional)</label><br>
+        <input id="origin" name="origin" type="text" inputmode="url" autocomplete="off" spellcheck="false"
+               aria-describedby="origin-help origin-error" size="40">
+      </p>
+      <p id="origin-error" class="status" role="alert"></p>
+      <div class="row">
+        <button type="submit" id="btn-save">Save</button>
+        <button type="button" id="btn-reset">Use default only</button>
+      </div>
+    </form>
+
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

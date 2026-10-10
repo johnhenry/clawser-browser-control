@@ -26,6 +26,7 @@ The extension requires browser permissions to provide its functionality. When ac
 - **Screenshots** — to capture visible page content for the agent
 - **Cookies** — to relay authentication state to the agent when requested
 - **Network requests** — to monitor page network activity when requested
+- **Browser-task drafts** — when you use the side panel or a right-click entry, the page title, URL, and (for a section) a selector and a short text hint of at most 120 characters are sent to your own Clawser tab as a draft. Nothing runs until you confirm it in Clawser
 - **WebMCP tools** — the names, descriptions and schemas of tools a web page registers on `document.modelContext`, and the result of a tool call, only when the local Clawser workspace asks for them
 
 All accessed data is processed locally and communicated only to the Clawser workspace running on your local machine (localhost).
@@ -36,7 +37,7 @@ The extension uses `chrome.storage.local` to persist configuration settings. No 
 
 ## Communication
 
-The extension communicates exclusively with the Clawser workspace via local messaging (content scripts on localhost/127.0.0.1 origins). It does not make any external network requests of its own.
+The extension communicates exclusively with the Clawser workspace via local messaging (content scripts on localhost/127.0.0.1 origins, `https://clawser.erisera.com`, and one https origin you may add on the options page). It does not make any external network requests of its own.
 
 ## Permissions Justification
 
@@ -50,6 +51,8 @@ The extension communicates exclusively with the Clawser workspace via local mess
 | `cookies` | Read cookies for authentication relay |
 | `storage` | Persist extension configuration locally |
 | `alarms` | Schedule periodic tasks (e.g., heartbeat) |
+| `sidePanel` | Show the browser-tasks panel (launchers, tab picker, task list, inbox) |
+| `contextMenus` | Add right-click entries that start a browser-task draft from the clicked section |
 | `debugger` (optional) | Advanced browser inspection when enabled by user |
 | `<all_urls>` (host) | Operate on any page the user directs the agent to |
 
