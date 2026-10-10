@@ -348,8 +348,10 @@ async function actionTabsList() {
   }));
 }
 
-async function actionTabOpen({ url }) {
-  const tab = await chrome.tabs.create({ url: url || 'about:blank', active: true });
+async function actionTabOpen({ url, active }) {
+  // Only an explicit `active: false` opens in the background (scheduled
+  // browser-task checks); anything else keeps the default of a foreground tab.
+  const tab = await chrome.tabs.create({ url: url || 'about:blank', active: active !== false });
   return { id: tab.id, url: tab.url || tab.pendingUrl, title: tab.title };
 }
 

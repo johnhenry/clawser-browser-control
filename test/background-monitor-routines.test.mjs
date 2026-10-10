@@ -183,3 +183,32 @@ describe('the temporary routine tab is not a place to deliver drafts', () => {
     assert.ok(sent.some((s) => s.tabId === 40 && s.msg.direction === 'btask_request'));
   });
 });
+
+describe('tab_open honours active:false (scheduled checks must not steal focus)', () => {
+  function bootOpen() {
+    const created = [];
+    const b = loadBackground({ tabs: { create: async (o) => { created.push(o); return { id: 7, url: o.url, title: '' }; } } });
+    return { b, created };
+  }
+  it('no active param: opens active as before', async () => {
+    const { b, created } = bootOpen();
+    await b.send('tab_open', { url: 'https://a.example/' });
+    assert.equal(created[0].active, true);
+  });
+  it('active:false: opens in the background', async () => {
+    const { b, created } = bootOpen();
+    await b.send('tab_open', { url: 'https://a.example/', active: false });
+    assert.equal(created[0].active, false);
+  });
+  it('only an explicit boolean false counts; other values keep the default', async () => {
+    const { b, created } = bootOpen();
+    for (const active of [0, null, 'false', undefined, true]) await b.send('tab_open', { url: 'https://a.example/', active });
+    assert.ok(created.every((c) => c.active === true));
+  });
+  it('routines whose meta.source is "btask" are scheduled like any other', async () => {
+    const { b, created } = boot();
+    b.idbStore.set('background_routine_state', [monitorRoutine({ trigger: {}, meta: { source: 'btask', scheduleType: 'interval', intervalMs: 300000, lastFired: 0 } })]);
+    await b.fireAlarm();
+    assert.equal(created.length, 1);
+  });
+});
