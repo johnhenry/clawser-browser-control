@@ -1505,6 +1505,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 const SCHEDULER_ALARM_NAME = 'clawser-scheduler';
 const ROUTINE_EXEC_TIMEOUT_MS = 30000;
+/** A watch check loads the watched page in a background tab first, which alone can take
+ * longer than 30 s on a slow site; closing the tab mid-check would fail every check. */
+const MONITOR_EXEC_TIMEOUT_MS = 120000;
+
+function routineTimeoutMs(routine) {
+  return routine?.action?.type === 'btask_monitor' ? MONITOR_EXEC_TIMEOUT_MS : ROUTINE_EXEC_TIMEOUT_MS;
+}
 const TAB_OPEN_WAIT_MS = 20000;
 
 /** @type {{tabId: number, url: string, wsId: string|null, lastSeen: number}|null} */
@@ -1575,12 +1582,12 @@ function handleNotify(msg, sender) {
 }
 
 /** Ask a specific tab to run a routine now, and wait for its result. */
-function requestRoutineExecution(tabId, routineId) {
+function requestRoutineExecution(tabId, routineId, timeoutMs = ROUTINE_EXEC_TIMEOUT_MS) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingRoutineExecutions.delete(routineId);
       resolve({ success: false, error: 'Timed out waiting for tab to execute routine' });
-    }, ROUTINE_EXEC_TIMEOUT_MS);
+    }, timeoutMs);
     pendingRoutineExecutions.set(routineId, { resolve, timer });
     chrome.tabs.sendMessage(tabId, { type: MARKER, direction: 'push', action: 'execute_routine', routineId })
       .catch((e) => {
@@ -1599,12 +1606,12 @@ function requestRoutineExecution(tabId, routineId) {
  * when no workspace has ever been seen.
  * @returns {Promise<{success: boolean, error: string|null}>}
  */
-async function delegateRoutineExecution(routineId) {
+async function delegateRoutineExecution(routineId, timeoutMs = ROUTINE_EXEC_TIMEOUT_MS) {
   if (lastKnownWorkspaceTab) {
     try {
       const tab = await chrome.tabs.get(lastKnownWorkspaceTab.tabId);
       if (tab && tab.url === lastKnownWorkspaceTab.url) {
-        return await requestRoutineExecution(lastKnownWorkspaceTab.tabId, routineId);
+        return await requestRoutineExecution(lastKnownWorkspaceTab.tabId, routineId, timeoutMs);
       }
     } catch {
       // Tab no longer exists — fall through to (re)opening one below.
@@ -1629,7 +1636,7 @@ async function delegateRoutineExecution(routineId) {
   });
 
   const result = ready
-    ? await requestRoutineExecution(openedTab.id, routineId)
+    ? await requestRoutineExecution(openedTab.id, routineId, timeoutMs)
     : { success: false, error: 'Opened a tab but it did not report ready in time' };
 
   try { await chrome.tabs.remove(openedTab.id); } catch { /* best-effort cleanup */ }
@@ -1762,7 +1769,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // while the slow run was going), never by writing back the array read above.
     const ran = [];
     for (const r of due) {
-      const { success, error } = await delegateRoutineExecution(r.id);
+      const { success, error } = await delegateRoutineExecution(r.id, routineTimeoutMs(r));
       const lastResult = success ? 'executed' : `skipped: ${error}`;
       ran.push({
         id: r.id,
