@@ -70,6 +70,7 @@ async function init() {
 
   // Clean up buffers when tabs close
   chrome.tabs.onRemoved.addListener((tabId) => {
+    tabLockStates.delete(tabId);
     consoleBuffers.delete(tabId);
     networkBuffers.delete(tabId);
   });
@@ -1539,6 +1540,39 @@ let schedulerBusy = false;
 
 const WORKSPACE_REF_KEY = 'workspaceRef';
 
+/** tabId -> { locked, capabilities } as last announced by that tab's workspace_ready / ping reply.
+ * A locked tab (vault passphrase prompt showing) can run only btask_monitor routines. */
+const tabLockStates = new Map();
+const LOCKED_SKIP_KEY = 'btaskLockedSkip';
+const MONITOR_CAPABILITY = 'btask_monitor';
+
+function cleanCapabilities(list) {
+  return Array.isArray(list) ? list.filter((c) => typeof c === 'string').map((c) => c.slice(0, 40)).slice(0, 10) : [];
+}
+
+/** Can a tab in this state be sent this kind of routine? */
+function tabAdmits(state, isMonitor) {
+  if (!state || !state.locked) return true;
+  return isMonitor && state.capabilities.includes(MONITOR_CAPABILITY);
+}
+
+const lockedResult = () => ({ success: false, error: 'not run: Clawser is locked', locked: true });
+
+async function setLockedSkip(on) {
+  try {
+    if (on) await chrome.storage?.session?.set({ [LOCKED_SKIP_KEY]: { at: Date.now() } });
+    else await chrome.storage?.session?.remove(LOCKED_SKIP_KEY);
+  } catch { /* status is best-effort */ }
+}
+
+async function getLockedSkip() {
+  try { return !!(await chrome.storage?.session?.get(LOCKED_SKIP_KEY))?.[LOCKED_SKIP_KEY]; } catch { return false; }
+}
+
+function isMonitorRoutine(r) {
+  return r?.action?.type === 'btask_monitor' || r?.actionType === 'btask_monitor';
+}
+
 /** Remember the live workspace tab (memory now, storage.local best-effort) if its origin is allowed. */
 function rememberWorkspace({ tabId, url, wsId }) {
   const lastSeen = Date.now();
@@ -1696,6 +1730,9 @@ function handleNotify(msg, sender) {
   if (msg.action === 'workspace_ready') {
     if (tabId !== undefined && tabUrl) {
       rememberWorkspace({ tabId, url: tabUrl, wsId: msg.wsId || null });
+      const locked = msg.locked === true;
+      tabLockStates.set(tabId, { locked, capabilities: cleanCapabilities(msg.capabilities) });
+      if (!locked) setLockedSkip(false);
       const waiter = pendingReadyWaiters.get(tabId);
       if (waiter) { pendingReadyWaiters.delete(tabId); waiter(); }
     }
@@ -1706,7 +1743,7 @@ function handleNotify(msg, sender) {
     if (pending) {
       pendingRoutineExecutions.delete(msg.routineId);
       clearTimeout(pending.timer);
-      pending.resolve({ success: !!msg.success, error: msg.error || null });
+      pending.resolve({ success: !!msg.success, error: msg.error || null, locked: msg.locked === true });
     }
   } else if (msg.action === 'pod_message') {
     // Relayed via pod-inject.js's extensionBridge (InjectedPod running in
@@ -1746,34 +1783,39 @@ function requestRoutineExecution(tabId, routineId, timeoutMs = ROUTINE_EXEC_TIME
 }
 
 /**
- * An open clawser tab on an allowed origin that announces (in its ping reply) that it hosts
- * workspace `wsId`. Tabs that do not answer, or announce another workspace, are skipped.
- * The scheduler's own temporary tabs are never candidates.
+ * Open clawser tabs on allowed origins whose ping reply announces workspace `wsId`, with the
+ * lock state each one reports. Tabs that do not answer, or announce another workspace, are
+ * skipped. The scheduler's own temporary tabs are never candidates. Unlocked tabs come first.
  */
-async function findLiveWorkspaceTab(wsId) {
-  if (!wsId) return null;
+async function findLiveWorkspaceTabs(wsId) {
+  if (!wsId) return [];
   let tabs;
-  try { tabs = await findClawserTabs(); } catch { return null; }
+  try { tabs = await findClawserTabs(); } catch { return []; }
   const answers = await Promise.all(tabs.map(async (tab) => {
     const r = await sendToTab(tab.id, { type: 'clawser.btask.ping' }, BTASK_PING_TIMEOUT_MS);
-    return !r.transport && r.result && r.result.wsId === wsId ? tab : null;
+    if (r.transport || !r.result || r.result.wsId !== wsId) return null;
+    const state = { locked: r.result.locked === true, capabilities: cleanCapabilities(r.result.capabilities) };
+    tabLockStates.set(tab.id, state);
+    return { tab, state };
   }));
-  return answers.find(Boolean) || null;
+  return answers.filter(Boolean).sort((a, b) => Number(a.state.locked) - Number(b.state.locked));
 }
 
 /**
  * Execute a due routine by delegating to a live Clawser tab — the
- * currently-known one if still open at the same URL, or a freshly
- * opened one at the last-known workspace URL otherwise. Never throws;
- * returns a description of what happened, including honest failure
- * when no workspace has ever been seen.
- * @returns {Promise<{success: boolean, error: string|null}>}
+ * currently-known one if still open at the same URL, an already-open tab for the same
+ * workspace, or a freshly opened background tab at the last-known workspace URL.
+ * A tab stopped at the vault prompt (locked) is sent only btask_monitor routines; anything
+ * else is reported as "not run: Clawser is locked". Never throws; returns a description of
+ * what happened, including honest failure when no workspace has ever been seen.
+ * @returns {Promise<{success: boolean, error: string|null, locked?: boolean}>}
  */
-async function delegateRoutineExecution(routineId, timeoutMs = ROUTINE_EXEC_TIMEOUT_MS) {
+async function delegateRoutineExecution(routineId, timeoutMs = ROUTINE_EXEC_TIMEOUT_MS, isMonitor = false) {
   if (lastKnownWorkspaceTab && lastKnownWorkspaceTab.tabId >= 0) {
     try {
       const tab = await chrome.tabs.get(lastKnownWorkspaceTab.tabId);
       if (tab && tab.url === lastKnownWorkspaceTab.url) {
+        if (!tabAdmits(tabLockStates.get(lastKnownWorkspaceTab.tabId), isMonitor)) return lockedResult();
         return await requestRoutineExecution(lastKnownWorkspaceTab.tabId, routineId, timeoutMs);
       }
     } catch {
@@ -1783,11 +1825,15 @@ async function delegateRoutineExecution(routineId, timeoutMs = ROUTINE_EXEC_TIME
 
   // After a service-worker restart (or if the remembered tab moved on) the user may
   // already have this workspace open: use that tab rather than opening a duplicate.
-  const live = await findLiveWorkspaceTab(lastKnownWorkspaceTab?.wsId ?? null);
-  if (live) {
-    rememberWorkspace({ tabId: live.id, url: live.url, wsId: lastKnownWorkspaceTab.wsId });
-    return requestRoutineExecution(live.id, routineId, timeoutMs);
+  const live = await findLiveWorkspaceTabs(lastKnownWorkspaceTab?.wsId ?? null);
+  const usable = live.find((l) => tabAdmits(l.state, isMonitor));
+  if (usable) {
+    rememberWorkspace({ tabId: usable.tab.id, url: usable.tab.url, wsId: lastKnownWorkspaceTab.wsId });
+    return requestRoutineExecution(usable.tab.id, routineId, timeoutMs);
   }
+  // The user's own tab is locked and this is not a monitor: nothing to run it on, and
+  // a background tab would be locked too.
+  if (live.length > 0 && !isMonitor) return lockedResult();
 
   if (!lastKnownWorkspaceTab?.url) {
     return { success: false, error: 'No known Clawser tab to execute this routine on (no live workspace has ever connected)' };
@@ -1801,17 +1847,21 @@ async function delegateRoutineExecution(routineId, timeoutMs = ROUTINE_EXEC_TIME
   }
   schedulerOwnedTabs.add(openedTab.id);
 
+  // The FIRST workspace_ready counts: a vault user's tab announces itself as locked (with the
+  // btask_monitor capability) before the passphrase is entered, and that is enough for monitors.
   const ready = await new Promise((resolve) => {
     const timer = setTimeout(() => { pendingReadyWaiters.delete(openedTab.id); resolve(false); }, TAB_OPEN_WAIT_MS);
     pendingReadyWaiters.set(openedTab.id, () => { clearTimeout(timer); resolve(true); });
   });
 
-  const result = ready
-    ? await requestRoutineExecution(openedTab.id, routineId, timeoutMs)
-    : { success: false, error: 'Opened a tab but it did not report ready in time' };
+  let result;
+  if (!ready) result = { success: false, error: 'Opened a tab but it did not report ready in time' };
+  else if (!tabAdmits(tabLockStates.get(openedTab.id), isMonitor)) result = lockedResult();
+  else result = await requestRoutineExecution(openedTab.id, routineId, timeoutMs);
 
   try { await chrome.tabs.remove(openedTab.id); } catch { /* best-effort cleanup */ }
   schedulerOwnedTabs.delete(openedTab.id);
+  tabLockStates.delete(openedTab.id);
   return result;
 }
 
@@ -1954,8 +2004,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // while the slow run was going), never by writing back the array read above.
     const ran = [];
     for (const r of due) {
-      const { success, error } = await delegateRoutineExecution(r.id, routineTimeoutMs(r));
-      const lastResult = success ? 'executed' : `skipped: ${error}`;
+      const res = await delegateRoutineExecution(r.id, routineTimeoutMs(r), isMonitorRoutine(r));
+      const { success, error } = res;
+      const lastResult = success ? 'executed' : (res.locked ? 'not run: Clawser is locked' : `skipped: ${error}`);
+      if (res.locked && !isMonitorRoutine(r)) await setLockedSkip(true);
+      else if (success && !isMonitorRoutine(r)) await setLockedSkip(false);
       ran.push({
         id: r.id,
         lastRun: Date.now(),
@@ -2390,6 +2443,8 @@ async function handleUiMessage(msg, sender) {
       return btaskDraftFromPanel(msg);
     case 'btask_open':
       return btaskOpenClawser();
+    case 'btask_sched_status':
+      return { lockedSkipped: await getLockedSkip() };
     case 'btask_notice':
       return { notice: publicNotice(await getNotice()) };
     case 'btask_dismiss':

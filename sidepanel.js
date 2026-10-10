@@ -163,8 +163,17 @@
     $('btn-retry').hidden = !n.canRetry;
   }
 
+  async function refreshSchedulerStatus() {
+    let st = null;
+    try { st = await call('btask_sched_status'); } catch { return; }
+    const on = !!(st && st.lockedSkipped);
+    $('sched-status').hidden = !on;
+    $('sched-status').textContent = on ? 'Clawser is locked: open it to run scheduled routines' : '';
+  }
+
   async function refresh() {
     refreshNotice();
+    refreshSchedulerStatus();
     const seq = ++refreshSeq;
     let list;
     let inbox;

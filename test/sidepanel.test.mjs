@@ -363,3 +363,20 @@ describe('side panel: keyboard focus survives toggling (real-browser bug)', () =
     assert.equal(p.doc.focused, radios[1]);
   });
 });
+
+describe('side panel: scheduler lock status', () => {
+  const respondWith = (lockedSkipped) => (m) => (m.action === 'btask_sched_status' ? { result: { lockedSkipped } } : connected(m));
+
+  it('says "Clawser is locked: open it to run scheduled routines" when routines were skipped for being locked', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: respondWith(true) });
+    await p.tick(); await p.tick();
+    assert.equal(p.$('sched-status').hidden, false);
+    assert.equal(p.$('sched-status').textContent, 'Clawser is locked: open it to run scheduled routines');
+  });
+
+  it('is hidden otherwise', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: respondWith(false) });
+    await p.tick(); await p.tick();
+    assert.equal(p.$('sched-status').hidden, true);
+  });
+});
