@@ -95,6 +95,7 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
     runtime: {
       id: 'ext-id',
       getURL: (p = '') => `chrome-extension://ext-id/${p}`,
+      getManifest: () => ({ version: '9.8.7' }),
       onMessage: { addListener: (fn) => { hooks.listener = fn; } },
       onInstalled: { addListener: (fn) => { hooks.installedListener = fn; } },
       onStartup: { addListener: (fn) => { hooks.startupListener = fn; } },

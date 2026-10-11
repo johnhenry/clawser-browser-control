@@ -52,3 +52,14 @@ describe('content.js — presence heartbeat keeps running while hidden', () => {
     assert.equal(liveIntervals.size, 1);
   });
 });
+
+describe('content.js — presence announcement', () => {
+  it('announces the manifest version, not a hardcoded one', async (t) => {
+    const ctx = loadContent();
+    t.after(() => ctx.stop());
+    await tick();
+    const presence = ctx.popPosted().find((m) => m.direction === 'presence');
+    assert.ok(presence, 'an initial presence announcement is posted');
+    assert.equal(presence.version, '9.8.7'); // the stub's chrome.runtime.getManifest().version
+  });
+});
