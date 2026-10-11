@@ -91,8 +91,10 @@ describe('sidepanel.html content', () => {
   it('offers the four entry actions', () => {
     for (const label of ['Compare tabs', 'Extract data', 'Watch page', 'Create workflow']) assert.ok(html.includes(label), label);
   });
-  it('says plainly that Watch page and Create workflow are not available yet', () => {
-    assert.ok((html.match(/Coming in a later release/g) || []).length >= 2);
+  it('says plainly that only Create workflow is not available yet', () => {
+    assert.equal((html.match(/Coming in a later release/g) || []).length, 1);
+    assert.match(html, /id="btn-workflow"[^>]*aria-disabled="true"/);
+    assert.doesNotMatch(html, /id="btn-watch"[^>]*aria-disabled/);
   });
   it('has sections for tasks and inbox and last run', () => {
     assert.match(html, /id="task-list"/);

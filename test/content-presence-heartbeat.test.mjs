@@ -15,37 +15,32 @@ async function freshLoad(t, chromeOverrides = {}, opts = {}) {
   return ctx;
 }
 
-describe('content.js — presence heartbeat visibility pause', () => {
+describe('content.js — presence heartbeat keeps running while hidden', () => {
+  // content.js only runs on clawser origins now, and a background tab opened by the
+  // scheduler is hidden from birth: pausing the heartbeat there meant the page never
+  // heard presence (clawser boots slowly) and never connected.
   it('starts the heartbeat interval when the tab is visible on load', async (t) => {
     const { liveIntervals } = await freshLoad(t);
     assert.equal(liveIntervals.size, 1, 'heartbeat interval should be running');
   });
 
-  it('does not start the heartbeat interval when the tab starts hidden', async (t) => {
+  it('starts the heartbeat interval even when the tab starts hidden', async (t) => {
     const { liveIntervals } = await freshLoad(t, {}, { hidden: true });
-    assert.equal(liveIntervals.size, 0, 'heartbeat interval should not start while hidden');
+    assert.equal(liveIntervals.size, 1, 'a background tab must still announce itself');
   });
 
-  it('stops the heartbeat interval when the tab becomes hidden', async (t) => {
+  it('keeps the heartbeat interval when the tab becomes hidden', async (t) => {
     const { liveIntervals, setHidden } = await freshLoad(t);
-    assert.equal(liveIntervals.size, 1);
-
     setHidden(true);
-
-    assert.equal(liveIntervals.size, 0, 'heartbeat interval should be cleared on hide');
+    assert.equal(liveIntervals.size, 1);
   });
 
-  it('resumes the heartbeat interval and re-announces when the tab becomes visible again', async (t) => {
+  it('re-announces immediately when the tab becomes visible, without a second interval', async (t) => {
     const { liveIntervals, setHidden, popPosted } = await freshLoad(t, {}, { hidden: true });
-    assert.equal(liveIntervals.size, 0);
-
     setHidden(false);
     await tick();
-
-    assert.equal(liveIntervals.size, 1, 'heartbeat interval should resume on show');
-    const posted = popPosted();
-    const presence = posted.find((m) => m.direction === 'presence');
-    assert.ok(presence, 'should re-announce presence immediately on becoming visible');
+    assert.equal(liveIntervals.size, 1);
+    assert.ok(popPosted().find((m) => m.direction === 'presence'));
   });
 
   it('toggling hidden repeatedly never leaves more than one live interval', async (t) => {
@@ -54,6 +49,6 @@ describe('content.js — presence heartbeat visibility pause', () => {
       setHidden(true);
       setHidden(false);
     }
-    assert.ok(liveIntervals.size <= 1, `expected at most 1 live interval, got ${liveIntervals.size}`);
+    assert.equal(liveIntervals.size, 1);
   });
 });

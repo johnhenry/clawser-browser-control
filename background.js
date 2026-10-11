@@ -70,6 +70,7 @@ async function init() {
 
   // Clean up buffers when tabs close
   chrome.tabs.onRemoved.addListener((tabId) => {
+    tabLockStates.delete(tabId);
     consoleBuffers.delete(tabId);
     networkBuffers.delete(tabId);
   });
@@ -114,7 +115,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender?.tab?.id ?? null;
   const tabUrl = sender?.tab?.url ?? null;
 
-  handleAction(msg.action, msg.params || {})
+  handleAction(msg.action, msg.params || {}, sender)
     .then((result) => {
       recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: true, error: null });
       sendResponse({ result });
@@ -135,10 +136,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
  * @param {object} params
  * @returns {Promise<any>}
  */
-async function handleAction(action, params) {
+async function handleAction(action, params, sender) {
   switch (action) {
     // ── Status ──
     case 'status': return actionStatus(params);
+    case 'routine_failures': return actionRoutineFailures(params, sender);
     case 'capabilities': return actionCapabilities(params);
     case 'get_available_capabilities': return getAvailableCapabilities();
 
@@ -348,8 +350,10 @@ async function actionTabsList() {
   }));
 }
 
-async function actionTabOpen({ url }) {
-  const tab = await chrome.tabs.create({ url: url || 'about:blank', active: true });
+async function actionTabOpen({ url, active }) {
+  // Only an explicit `active: false` opens in the background (scheduled
+  // browser-task checks); anything else keeps the default of a foreground tab.
+  const tab = await chrome.tabs.create({ url: url || 'about:blank', active: active !== false });
   return { id: tab.id, url: tab.url || tab.pendingUrl, title: tab.title };
 }
 
@@ -1503,7 +1507,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 const SCHEDULER_ALARM_NAME = 'clawser-scheduler';
 const ROUTINE_EXEC_TIMEOUT_MS = 30000;
-const TAB_OPEN_WAIT_MS = 20000;
+/** A watch check loads the watched page in a background tab first, which alone can take
+ * longer than 30 s on a slow site; closing the tab mid-check would fail every check. */
+const MONITOR_EXEC_TIMEOUT_MS = 120000;
+
+function routineTimeoutMs(routine) {
+  return (routine?.action?.type === 'btask_monitor' || routine?.actionType === 'btask_monitor') ? MONITOR_EXEC_TIMEOUT_MS : ROUTINE_EXEC_TIMEOUT_MS;
+}
+/** The page can take a while to connect (slow boot; the locked runner starts early but not instantly). */
+const TAB_OPEN_WAIT_MS = 60000;
 
 /** @type {{tabId: number, url: string, wsId: string|null, lastSeen: number}|null} */
 let lastKnownWorkspaceTab = null;
@@ -1513,6 +1525,188 @@ const pendingRoutineExecutions = new Map();
 
 /** @type {Map<number, Function>} tabId -> resolve fn, for tabs we're waiting on to report ready */
 const pendingReadyWaiters = new Map();
+
+/** Tabs the scheduler opened for a routine and will close again. Browser-task
+ * drafts and requests must never be delivered to one of these. */
+const schedulerOwnedTabs = new Set();
+
+/** True while an alarm is processing due routines, so a slow run is not
+ * started a second time by the next minute's alarm. */
+let schedulerBusy = false;
+
+// ── Workspace reference (survives service-worker restarts) ────────
+//
+// lastKnownWorkspaceTab alone lives in memory and is lost when the worker is
+// killed. {wsId, url, lastSeen} is mirrored to chrome.storage.local so a cold
+// start can still open the workspace in a background tab.
+
+const WORKSPACE_REF_KEY = 'workspaceRef';
+
+/** tabId -> { locked, capabilities } as last announced by that tab's workspace_ready / ping reply.
+ * A locked tab (vault passphrase prompt showing) can run only btask_monitor routines. */
+const tabLockStates = new Map();
+const LOCKED_SKIP_KEY = 'btaskLockedSkip';
+const MONITOR_CAPABILITY = 'btask_monitor';
+
+function cleanCapabilities(list) {
+  return Array.isArray(list) ? list.filter((c) => typeof c === 'string').map((c) => c.slice(0, 40)).slice(0, 10) : [];
+}
+
+/** Can a tab in this state be sent this kind of routine? */
+function tabAdmits(state, isMonitor) {
+  if (!state || !state.locked) return true;
+  return isMonitor && state.capabilities.includes(MONITOR_CAPABILITY);
+}
+
+const lockedResult = () => ({ success: false, error: 'not run: Clawser is locked', locked: true });
+
+async function setLockedSkip(on) {
+  try {
+    if (on) await chrome.storage?.session?.set({ [LOCKED_SKIP_KEY]: { at: Date.now() } });
+    else await chrome.storage?.session?.remove(LOCKED_SKIP_KEY);
+  } catch { /* status is best-effort */ }
+}
+
+async function getLockedSkip() {
+  try { return !!(await chrome.storage?.session?.get(LOCKED_SKIP_KEY))?.[LOCKED_SKIP_KEY]; } catch { return false; }
+}
+
+function isMonitorRoutine(r) {
+  return r?.action?.type === 'btask_monitor' || r?.actionType === 'btask_monitor';
+}
+
+/** Remember the live workspace tab (memory now, storage.local best-effort) if its origin is allowed. */
+function rememberWorkspace({ tabId, url, wsId }) {
+  const lastSeen = Date.now();
+  lastKnownWorkspaceTab = { tabId, url, wsId, lastSeen };
+  persistWorkspaceRef({ wsId, url, lastSeen }).catch(() => {});
+}
+
+async function persistWorkspaceRef(ref) {
+  if (!isClawserUrl(ref.url, await getCustomOrigin())) return;
+  await chrome.storage.local.set({ [WORKSPACE_REF_KEY]: ref });
+}
+
+/** Load the persisted reference once at worker start; a live message that arrived first wins. */
+async function loadWorkspaceRef() {
+  try {
+    const stored = (await chrome.storage.local.get(WORKSPACE_REF_KEY))?.[WORKSPACE_REF_KEY];
+    if (!stored || typeof stored !== 'object') return;
+    const { wsId, url, lastSeen } = stored;
+    if (wsId !== null && (typeof wsId !== 'string' || wsId.length > 100)) return;
+    if (typeof url !== 'string' || url.length > BTASK_MAX_URL) return;
+    if (!isClawserUrl(url, await getCustomOrigin())) return; // origin no longer allowed: do not open it
+    if (!lastKnownWorkspaceTab) {
+      lastKnownWorkspaceTab = { tabId: -1, url, wsId, lastSeen: Number.isFinite(lastSeen) ? lastSeen : 0 };
+    }
+  } catch { /* storage unavailable: behave as a fresh start */ }
+}
+
+const workspaceRefLoaded = loadWorkspaceRef();
+
+// ── Routine sync from the page ────────────────────────────────────
+//
+// The page and the extension have separate IndexedDB stores (different
+// origins), so the page pushes its schedulable routines here. The extension
+// never receives an action payload: it only learns when each routine is due
+// and asks the page to run it by id.
+
+const SYNC_MAX_ROUTINES = 500;
+const SYNC_MAX_NAME = 200;
+const SYNC_MIN_INTERVAL_MS = 60000;
+const SYNC_MAX_INTERVAL_MS = 366 * 24 * 3600 * 1000;
+const SYNC_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
+
+function sanitizeSyncedTrigger(t) {
+  if (!t || typeof t !== 'object') return null;
+  if (t.type === 'cron') {
+    return typeof t.cron === 'string' && validateCronExpressionInline(t.cron) ? { type: 'cron', cron: t.cron.trim() } : null;
+  }
+  if (t.type === 'interval') {
+    if (typeof t.intervalMs !== 'number' || !Number.isFinite(t.intervalMs)) return null;
+    return { type: 'interval', intervalMs: Math.min(Math.max(Math.floor(t.intervalMs), SYNC_MIN_INTERVAL_MS), SYNC_MAX_INTERVAL_MS) };
+  }
+  if (t.type === 'once') {
+    const at = typeof t.at === 'number' ? t.at : (typeof t.at === 'string' ? Date.parse(t.at) : NaN);
+    return Number.isFinite(at) && at > 0 ? { type: 'once', at: Math.floor(at) } : null;
+  }
+  return null;
+}
+
+function sanitizeSyncedRoutines(list, wsId) {
+  const out = [];
+  const seen = new Set();
+  for (const r of Array.isArray(list) ? list : []) {
+    if (out.length >= SYNC_MAX_ROUTINES) break;
+    if (!r || typeof r !== 'object' || typeof r.id !== 'string' || !SYNC_ID_RE.test(r.id) || seen.has(r.id)) continue;
+    const trigger = sanitizeSyncedTrigger(r.trigger);
+    if (!trigger) continue;
+    seen.add(r.id);
+    const actionType = clampText(typeof r.actionType === 'string' ? r.actionType : '', 40);
+    out.push({
+      id: r.id,
+      wsId,
+      name: clampText(typeof r.name === 'string' ? r.name : r.id, SYNC_MAX_NAME),
+      enabled: r.enabled === true,
+      trigger,
+      actionType,
+      action: { type: actionType }, // informational only; never an executable payload
+    });
+  }
+  return out;
+}
+
+async function handleRoutinesSync(msg, sender) {
+  const tabId = sender?.tab?.id;
+  const tabUrl = sender?.tab?.url;
+  if (tabId === undefined || typeof tabUrl !== 'string') return;
+  if (!isClawserUrl(tabUrl, await getCustomOrigin())) return;
+  const wsId = msg.wsId;
+  if (typeof wsId !== 'string' || wsId.length < 1 || wsId.length > 100) return;
+  if (!Array.isArray(msg.routines)) return;
+
+  rememberWorkspace({ tabId, url: tabUrl, wsId });
+  const incoming = sanitizeSyncedRoutines(msg.routines, wsId);
+  const now = Date.now();
+
+  const db = await new Promise((resolve, reject) => {
+    const req = indexedDB.open('clawser_checkpoints', 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains('checkpoints')) req.result.createObjectStore('checkpoints');
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  try {
+    // One readwrite transaction (get, then put): definitions come from the page, the
+    // extension's own bookkeeping is kept by id, ids missing from the sync are removed,
+    // and other workspaces' routines are left alone.
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('checkpoints', 'readwrite');
+      const store = tx.objectStore('checkpoints');
+      const get = store.get('background_routine_state');
+      get.onsuccess = () => {
+        const current = Array.isArray(get.result) ? get.result : [];
+        const previous = new Map(current.filter((r) => r && r.wsId === wsId).map((r) => [r.id, r]));
+        const others = current.filter((r) => !(r && r.wsId === wsId));
+        const mine = incoming.map((r) => {
+          const prev = previous.get(r.id);
+          r.state = prev?.state && typeof prev.state === 'object' ? prev.state : {};
+          r.meta = prev?.meta && typeof prev.meta === 'object' ? prev.meta : {};
+          if (r.trigger.type === 'interval' && r.meta.lastFired == null) r.meta.lastFired = now; // first check one interval from now
+          if (r.trigger.type === 'once' && prev && prev.trigger?.at !== r.trigger.at) delete r.meta.fired;
+          return r;
+        });
+        store.put([...others, ...mine], 'background_routine_state');
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
+    });
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
+}
 
 // Set up the alarm on extension install/update
 chrome.runtime.onInstalled.addListener(() => {
@@ -1537,16 +1731,21 @@ function handleNotify(msg, sender) {
 
   if (msg.action === 'workspace_ready') {
     if (tabId !== undefined && tabUrl) {
-      lastKnownWorkspaceTab = { tabId, url: tabUrl, wsId: msg.wsId || null, lastSeen: Date.now() };
+      rememberWorkspace({ tabId, url: tabUrl, wsId: msg.wsId || null });
+      const locked = msg.locked === true;
+      tabLockStates.set(tabId, { locked, capabilities: cleanCapabilities(msg.capabilities), wsId: typeof msg.wsId === 'string' ? msg.wsId : null });
+      if (!locked) setLockedSkip(false);
       const waiter = pendingReadyWaiters.get(tabId);
       if (waiter) { pendingReadyWaiters.delete(tabId); waiter(); }
     }
+  } else if (msg.action === 'routines_sync') {
+    handleRoutinesSync(msg, sender).catch((e) => console.warn('[clawser-ext] routines_sync failed:', e));
   } else if (msg.action === 'routine_executed') {
     const pending = pendingRoutineExecutions.get(msg.routineId);
     if (pending) {
       pendingRoutineExecutions.delete(msg.routineId);
       clearTimeout(pending.timer);
-      pending.resolve({ success: !!msg.success, error: msg.error || null });
+      pending.resolve({ success: !!msg.success, error: msg.error || null, locked: msg.locked === true });
     }
   } else if (msg.action === 'pod_message') {
     // Relayed via pod-inject.js's extensionBridge (InjectedPod running in
@@ -1565,12 +1764,16 @@ function handleNotify(msg, sender) {
 }
 
 /** Ask a specific tab to run a routine now, and wait for its result. */
-function requestRoutineExecution(tabId, routineId) {
+function requestRoutineExecution(tabId, routineId, timeoutMs = ROUTINE_EXEC_TIMEOUT_MS) {
+  // The same routine must never run in two tabs at once: refuse rather than queue behind it.
+  if (pendingRoutineExecutions.has(routineId)) {
+    return Promise.resolve({ success: false, error: 'This routine is already running' });
+  }
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingRoutineExecutions.delete(routineId);
       resolve({ success: false, error: 'Timed out waiting for tab to execute routine' });
-    }, ROUTINE_EXEC_TIMEOUT_MS);
+    }, timeoutMs);
     pendingRoutineExecutions.set(routineId, { resolve, timer });
     chrome.tabs.sendMessage(tabId, { type: MARKER, direction: 'push', action: 'execute_routine', routineId })
       .catch((e) => {
@@ -1582,24 +1785,57 @@ function requestRoutineExecution(tabId, routineId) {
 }
 
 /**
- * Execute a due routine by delegating to a live Clawser tab — the
- * currently-known one if still open at the same URL, or a freshly
- * opened one at the last-known workspace URL otherwise. Never throws;
- * returns a description of what happened, including honest failure
- * when no workspace has ever been seen.
- * @returns {Promise<{success: boolean, error: string|null}>}
+ * Open clawser tabs on allowed origins whose ping reply announces workspace `wsId`, with the
+ * lock state each one reports. Tabs that do not answer, or announce another workspace, are
+ * skipped. The scheduler's own temporary tabs are never candidates. Unlocked tabs come first.
  */
-async function delegateRoutineExecution(routineId) {
-  if (lastKnownWorkspaceTab) {
+async function findLiveWorkspaceTabs(wsId) {
+  if (!wsId) return [];
+  let tabs;
+  try { tabs = await findClawserTabs(); } catch { return []; }
+  const answers = await Promise.all(tabs.map(async (tab) => {
+    const r = await sendToTab(tab.id, { type: 'clawser.btask.ping' }, BTASK_PING_TIMEOUT_MS);
+    if (r.transport || !r.result || r.result.wsId !== wsId) return null;
+    const state = { locked: r.result.locked === true, capabilities: cleanCapabilities(r.result.capabilities) };
+    tabLockStates.set(tab.id, state);
+    return { tab, state };
+  }));
+  return answers.filter(Boolean).sort((a, b) => Number(a.state.locked) - Number(b.state.locked));
+}
+
+/**
+ * Execute a due routine by delegating to a live Clawser tab — the
+ * currently-known one if still open at the same URL, an already-open tab for the same
+ * workspace, or a freshly opened background tab at the last-known workspace URL.
+ * A tab stopped at the vault prompt (locked) is sent only btask_monitor routines; anything
+ * else is reported as "not run: Clawser is locked". Never throws; returns a description of
+ * what happened, including honest failure when no workspace has ever been seen.
+ * @returns {Promise<{success: boolean, error: string|null, locked?: boolean}>}
+ */
+async function delegateRoutineExecution(routineId, timeoutMs = ROUTINE_EXEC_TIMEOUT_MS, isMonitor = false) {
+  if (lastKnownWorkspaceTab && lastKnownWorkspaceTab.tabId >= 0) {
     try {
       const tab = await chrome.tabs.get(lastKnownWorkspaceTab.tabId);
       if (tab && tab.url === lastKnownWorkspaceTab.url) {
-        return await requestRoutineExecution(lastKnownWorkspaceTab.tabId, routineId);
+        if (!tabAdmits(tabLockStates.get(lastKnownWorkspaceTab.tabId), isMonitor)) return lockedResult();
+        return await requestRoutineExecution(lastKnownWorkspaceTab.tabId, routineId, timeoutMs);
       }
     } catch {
       // Tab no longer exists — fall through to (re)opening one below.
     }
   }
+
+  // After a service-worker restart (or if the remembered tab moved on) the user may
+  // already have this workspace open: use that tab rather than opening a duplicate.
+  const live = await findLiveWorkspaceTabs(lastKnownWorkspaceTab?.wsId ?? null);
+  const usable = live.find((l) => tabAdmits(l.state, isMonitor));
+  if (usable) {
+    rememberWorkspace({ tabId: usable.tab.id, url: usable.tab.url, wsId: lastKnownWorkspaceTab.wsId });
+    return requestRoutineExecution(usable.tab.id, routineId, timeoutMs);
+  }
+  // The user's own tab is locked and this is not a monitor: nothing to run it on, and
+  // a background tab would be locked too.
+  if (live.length > 0 && !isMonitor) return lockedResult();
 
   if (!lastKnownWorkspaceTab?.url) {
     return { success: false, error: 'No known Clawser tab to execute this routine on (no live workspace has ever connected)' };
@@ -1611,17 +1847,23 @@ async function delegateRoutineExecution(routineId) {
   } catch (e) {
     return { success: false, error: `Could not open a tab to run this routine: ${e.message}` };
   }
+  schedulerOwnedTabs.add(openedTab.id);
 
+  // The FIRST workspace_ready counts: a vault user's tab announces itself as locked (with the
+  // btask_monitor capability) before the passphrase is entered, and that is enough for monitors.
   const ready = await new Promise((resolve) => {
     const timer = setTimeout(() => { pendingReadyWaiters.delete(openedTab.id); resolve(false); }, TAB_OPEN_WAIT_MS);
     pendingReadyWaiters.set(openedTab.id, () => { clearTimeout(timer); resolve(true); });
   });
 
-  const result = ready
-    ? await requestRoutineExecution(openedTab.id, routineId)
-    : { success: false, error: 'Opened a tab but it did not report ready in time' };
+  let result;
+  if (!ready) result = { success: false, error: 'Opened a tab but it did not report ready in time' };
+  else if (!tabAdmits(tabLockStates.get(openedTab.id), isMonitor)) result = lockedResult();
+  else result = await requestRoutineExecution(openedTab.id, routineId, timeoutMs);
 
   try { await chrome.tabs.remove(openedTab.id); } catch { /* best-effort cleanup */ }
+  schedulerOwnedTabs.delete(openedTab.id);
+  tabLockStates.delete(openedTab.id);
   return result;
 }
 
@@ -1656,8 +1898,62 @@ function validateCronExpressionInline(expr) {
   return parts.every((p, i) => validateCronFieldRange(p, CRON_FIELD_RANGES[i][0], CRON_FIELD_RANGES[i][1]));
 }
 
+// ── Retry backoff and recent failures ─────────────────────────────
+
+const RETRY_BACKOFF_MS = [60000, 120000, 300000, 600000];
+const FAILURES_KEY = 'background_routine_failures';
+const FAILURES_MAX = 200;
+const FAILURES_REPLY_MAX = 50;
+
+/** Delay before retrying after the `failures`-th consecutive failure: 1, 2, 5, 10 min, then 10; never beyond the routine's own interval. */
+function retryDelayMs(failures, routine) {
+  let d = RETRY_BACKOFF_MS[Math.min(Math.max(failures, 1) - 1, RETRY_BACKOFF_MS.length - 1)];
+  const every = routine?.trigger?.type === 'interval' ? routine.trigger.intervalMs : routine?.meta?.scheduleType === 'interval' ? routine.meta.intervalMs : null;
+  if (Number.isFinite(every) && every > 0) d = Math.min(d, every);
+  return d;
+}
+
+/**
+ * Recent failed background attempts for the requesting tab's own workspace, so the page can show
+ * them on its next load. Allowed origins only, and only for the workspace that tab announced.
+ */
+async function actionRoutineFailures(params, sender) {
+  const tab = sender?.tab;
+  if (!tab || typeof tab.url !== 'string' || !isClawserUrl(tab.url, await getCustomOrigin())) throw new Error('Not allowed from this page');
+  const wsId = params?.wsId;
+  if (typeof wsId !== 'string' || wsId.length < 1 || wsId.length > 100) throw new Error('wsId is required');
+  if (tabLockStates.get(tab.id)?.wsId !== wsId) throw new Error('Unknown workspace for this tab');
+  const since = typeof params.since === 'number' && Number.isFinite(params.since) ? params.since : 0;
+
+  const db = await new Promise((resolve, reject) => {
+    const req = indexedDB.open('clawser_checkpoints', 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains('checkpoints')) req.result.createObjectStore('checkpoints');
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  try {
+    const all = await new Promise((resolve) => {
+      const r = db.transaction('checkpoints', 'readonly').objectStore('checkpoints').get(FAILURES_KEY);
+      r.onsuccess = () => resolve(Array.isArray(r.result) ? r.result : []);
+      r.onerror = () => resolve([]);
+    });
+    const mine = all
+      .filter((f) => f && f.wsId === wsId && Number.isFinite(f.at) && f.at > since)
+      .slice(-FAILURES_REPLY_MAX)
+      .map((f) => ({ at: f.at, routineId: clampText(String(f.routineId ?? ''), 100), error: clampText(String(f.error ?? ''), 300) }));
+    return { failures: mine };
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
+}
+
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== SCHEDULER_ALARM_NAME) return;
+  if (schedulerBusy) return; // the previous alarm is still running its routines
+  schedulerBusy = true;
+  await workspaceRefLoaded; // a cold-started worker must know the workspace before deciding what runs
 
   try {
     const DB_NAME = 'clawser_checkpoints';
@@ -1681,14 +1977,6 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       const req = tx.objectStore(STORE).get(key);
       req.onsuccess = () => resolve(req.result ?? null);
       req.onerror = () => resolve(null);
-    });
-
-    const write = (key, data) => new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readwrite');
-      tx.objectStore(STORE).put(data, key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
     });
 
     const routines = await read(ROUTINE_KEY);
@@ -1728,8 +2016,27 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // time (async, potentially slow if a tab needs to be opened) so we
     // don't race concurrent IDB writes against ourselves.
     const due = [];
+    const currentWsId = lastKnownWorkspaceTab?.wsId ?? null;
     for (const r of routines) {
       if (!r.enabled) continue;
+      // Routines synced from a page carry their wsId: run only the known workspace's.
+      // (Untagged routines predate the sync and run as before.)
+      if (r.wsId != null && r.wsId !== currentWsId) continue;
+
+      // A failed attempt waits for its backoff, then retries regardless of the schedule.
+      if (Number.isFinite(r.state?.retryAt) && r.state.retryAt > 0) {
+        if (now >= r.state.retryAt) due.push(r);
+        continue;
+      }
+
+      if (r.trigger?.type === 'interval' && Number.isFinite(r.trigger.intervalMs)) {
+        if (now >= (r.meta?.lastFired || 0) + r.trigger.intervalMs) due.push(r);
+        continue;
+      }
+      if (r.trigger?.type === 'once') {
+        if (!r.meta?.fired && Number.isFinite(r.trigger.at) && now >= r.trigger.at) due.push(r);
+        continue;
+      }
 
       if (r.trigger?.type === 'cron' && r.trigger?.cron) {
         if (!validateCronExpressionInline(r.trigger.cron)) {
@@ -1751,31 +2058,94 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       }
     }
 
+    // What this run owns on each routine it ran. Applied later onto the *current*
+    // stored array (the page may have added, paused, edited or deleted routines
+    // while the slow run was going), never by writing back the array read above.
+    const ran = [];
     for (const r of due) {
-      const { success, error } = await delegateRoutineExecution(r.id);
-      r.state = r.state || {};
-      r.state.lastRun = Date.now();
-      r.state.lastResult = success ? 'executed' : `skipped: ${error}`;
-      r.state.runCount = (r.state.runCount || 0) + 1;
-      if (r.trigger?.type === 'cron') r.state.lastCronMinute = Math.floor(now / 60000);
-      if (r.meta?.scheduleType === 'interval') r.meta.lastFired = now;
-      if (r.meta?.scheduleType === 'once') r.meta.fired = true;
-      results.push({ routineId: r.id, success, error });
+      const res = await delegateRoutineExecution(r.id, routineTimeoutMs(r), isMonitorRoutine(r));
+      const { success, error } = res;
+      // The locked runner marks every reply locked:true; only its refusal ('locked') or our own
+      // pre-check means "not run because locked". A real error keeps its message.
+      const refused = !success && res.locked === true && (error === 'locked' || error === lockedResult().error);
+      const failed = !success && !refused; // a deliberate "locked" skip is not a failure
+      const lastResult = success ? 'executed' : (refused ? 'not run: Clawser is locked' : `skipped: ${error}`);
+      if (refused && !isMonitorRoutine(r)) await setLockedSkip(true);
+      else if (success && !isMonitorRoutine(r)) await setLockedSkip(false);
+      ran.push({
+        id: r.id,
+        lastRun: Date.now(),
+        lastResult,
+        lastCronMinute: r.trigger?.type === 'cron' ? Math.floor(now / 60000) : null,
+        interval: r.meta?.scheduleType === 'interval' || r.trigger?.type === 'interval',
+        once: r.meta?.scheduleType === 'once' || r.trigger?.type === 'once',
+        failed,
+        error: failed ? clampText(String(error || 'failed'), 300) : null,
+      });
+      const attempt = (r.state?.failures || 0) + 1;
+      results.push({ routineId: r.id, success, error, attempt, nextRetryAt: failed ? Date.now() + retryDelayMs(attempt, r) : null });
       if (!success) console.warn(`[clawser-ext] Routine "${r.name || r.id}" not executed: ${error}`);
     }
 
     if (results.length > 0) {
-      await write(ROUTINE_KEY, routines);
-      const log = (await read(LOG_KEY)) || [];
-      log.push({ timestamp: now, results });
-      while (log.length > 100) log.shift();
-      await write(LOG_KEY, log);
+      // One readwrite transaction (get, then put) so the merge is atomic in IDB.
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, 'readwrite');
+        const store = tx.objectStore(STORE);
+        const getRoutines = store.get(ROUTINE_KEY);
+        getRoutines.onsuccess = () => {
+          const current = Array.isArray(getRoutines.result) ? getRoutines.result : [];
+          const newFailures = [];
+          for (const o of ran) {
+            const cur = current.find((c) => c && c.id === o.id);
+            if (!cur) continue; // deleted meanwhile: never bring it back
+            cur.state = cur.state || {};
+            cur.state.lastRun = o.lastRun;
+            cur.state.lastResult = o.lastResult;
+            cur.state.runCount = (cur.state.runCount || 0) + 1;
+            if (o.failed) {
+              // Do not advance the schedule: retry at the next due attempt, with backoff.
+              cur.state.failures = (cur.state.failures || 0) + 1;
+              cur.state.retryAt = o.lastRun + retryDelayMs(cur.state.failures, cur);
+              if (typeof cur.wsId === 'string') newFailures.push({ wsId: cur.wsId, routineId: cur.id, at: o.lastRun, error: o.error });
+              continue;
+            }
+            delete cur.state.failures;
+            delete cur.state.retryAt;
+            if (o.lastCronMinute !== null) cur.state.lastCronMinute = o.lastCronMinute;
+            if (cur.meta && o.interval) cur.meta.lastFired = now;
+            if (cur.meta && o.once) cur.meta.fired = true;
+          }
+          store.put(current, ROUTINE_KEY);
+          if (newFailures.length) {
+            const getFail = store.get(FAILURES_KEY);
+            getFail.onsuccess = () => {
+              const list = Array.isArray(getFail.result) ? getFail.result : [];
+              list.push(...newFailures);
+              while (list.length > FAILURES_MAX) list.shift();
+              store.put(list, FAILURES_KEY);
+            };
+          }
+          const getLog = store.get(LOG_KEY);
+          getLog.onsuccess = () => {
+            const log = Array.isArray(getLog.result) ? getLog.result : [];
+            log.push({ timestamp: now, results });
+            while (log.length > 100) log.shift();
+            store.put(log, LOG_KEY);
+          };
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
+      });
     }
 
     db.close();
   } catch (err) {
     console.warn('[clawser] Background scheduler error:', err);
     try { db?.close(); } catch { /* best-effort */ }
+  } finally {
+    schedulerBusy = false;
   }
 });
 
@@ -2158,6 +2528,8 @@ async function handleUiMessage(msg, sender) {
       return btaskDraftFromPanel(msg);
     case 'btask_open':
       return btaskOpenClawser();
+    case 'btask_sched_status':
+      return { lockedSkipped: await getLockedSkip() };
     case 'btask_notice':
       return { notice: publicNotice(await getNotice()) };
     case 'btask_dismiss':
@@ -2215,7 +2587,7 @@ async function findClawserTabs() {
   const custom = await getCustomOrigin();
   const tabs = await chrome.tabs.query({});
   return tabs
-    .filter((t) => typeof t.url === 'string' && isClawserUrl(t.url, custom))
+    .filter((t) => typeof t.url === 'string' && isClawserUrl(t.url, custom) && !schedulerOwnedTabs.has(t.id))
     .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))
     .slice(0, BTASK_MAX_CANDIDATE_TABS);
 }
