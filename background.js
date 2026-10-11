@@ -379,23 +379,85 @@ async function actionTabReload({ tabId }) {
 
 // -- Navigation --
 
+/** How long navigate / back / forward wait for the navigation to commit. */
+const NAV_COMMIT_TIMEOUT_MS = 10000;
+
+/** tabId -> promise of the navigation in flight, so a back/forward/navigate issued meanwhile waits for it. */
+const pendingNavigations = new Map();
+
+/**
+ * Run `trigger` (tabs.update / goBack / goForward) and wait until the tab's navigation COMMITS.
+ * chrome.tabs.update() resolves as soon as the navigation is requested, before the new history
+ * entry exists; a back issued right then found nothing to go back to. Resolves with
+ * { committed, url } ; `url` is the committed URL (or null if it never committed in time).
+ * Rejects if the trigger fails or the tab ends on Chrome's error page.
+ */
+async function navigateAndWait(tid, trigger) {
+  const prior = pendingNavigations.get(tid);
+  if (prior) await prior.catch(() => {});
+
+  const run = (async () => {
+    let finish;
+    const committed = new Promise((resolve) => { finish = resolve; });
+    const listener = (id, info) => {
+      if (id !== tid || !info) return;
+      if (info.url || info.status === 'complete') finish(true);
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    const timer = setTimeout(() => finish(false), NAV_COMMIT_TIMEOUT_MS);
+    try {
+      await trigger();
+      const ok = await committed;
+      let url = null;
+      if (ok) {
+        try { const t = await chrome.tabs.get(tid); url = t.url || t.pendingUrl || null; } catch { /* tab gone */ }
+      }
+      return { committed: ok, url };
+    } finally {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+    }
+  })();
+  pendingNavigations.set(tid, run);
+  try { return await run; } finally { if (pendingNavigations.get(tid) === run) pendingNavigations.delete(tid); }
+}
+
+/**
+ * Navigate a tab and wait for the navigation to commit (history entry created), so back and
+ * forward work immediately afterwards. Pushes a normal history entry, like following a link.
+ * Result: { tabId, url, committed }. committed:false means no commit within 10 s (url is the one asked for).
+ */
 async function actionNavigate({ tabId, url }) {
   if (!url) throw new Error('url is required');
   const tid = await resolveTabId({ tabId });
-  const tab = await chrome.tabs.update(tid, { url });
-  return { tabId: tid, url: tab.url || tab.pendingUrl };
+  const res = await navigateAndWait(tid, () => chrome.tabs.update(tid, { url }));
+  if (res.url && res.url.startsWith('chrome-error://')) throw new Error(`Navigation failed: could not load ${url}`);
+  return { tabId: tid, url: res.url || url, committed: res.committed };
+}
+
+/** Chrome words "no page to go to" as "next page" for BOTH directions; say what it means. */
+function historyError(err, direction) {
+  const msg = String(err?.message || err);
+  if (/Cannot find a (next|previous) page in history/i.test(msg)) {
+    return new Error(direction === 'back'
+      ? "No earlier page in this tab's history to go back to"
+      : "No later page in this tab's history to go forward to");
+  }
+  return err;
 }
 
 async function actionGoBack({ tabId }) {
   const tid = await resolveTabId({ tabId });
-  await chrome.tabs.goBack(tid);
-  return { tabId: tid, direction: 'back' };
+  let res;
+  try { res = await navigateAndWait(tid, () => chrome.tabs.goBack(tid)); } catch (e) { throw historyError(e, 'back'); }
+  return { tabId: tid, direction: 'back', url: res.url, committed: res.committed };
 }
 
 async function actionGoForward({ tabId }) {
   const tid = await resolveTabId({ tabId });
-  await chrome.tabs.goForward(tid);
-  return { tabId: tid, direction: 'forward' };
+  let res;
+  try { res = await navigateAndWait(tid, () => chrome.tabs.goForward(tid)); } catch (e) { throw historyError(e, 'forward'); }
+  return { tabId: tid, direction: 'forward', url: res.url, committed: res.committed };
 }
 
 // -- Screenshots & Window --
@@ -636,131 +698,235 @@ function clampMaxChars(v) {
 // unsafe-eval-tolerant page CSPs (unlike actionEvaluate/actionWait, which
 // already accept that trade-off deliberately for their own reasons).
 
-async function actionClick({ tabId, selector, text, x, y }) {
-  assertHasTarget({ selector, text, x, y });
-  assertValidCoordPair(x, y);
-  const tid = await resolveTabId({ tabId });
-  return executeInTab(tid, (sel, txt, cx, cy) => {
-    let el;
-    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
-    else if (sel) el = document.querySelector(sel);
-    else if (txt) {
-      const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
-      for (const e of semantic) { if (e.textContent?.trim()?.includes(txt)) { el = e; break; } }
-      if (!el) for (const e of document.querySelectorAll('*')) {
-        if (e.children.length < 3 && e.textContent?.trim()?.includes(txt)) { el = e; break; }
-      }
+// Pointer actions (click, double-click, triple-click, right-click, hover) share ONE
+// in-page implementation, so they all resolve a target the same way (see
+// pointerActionInPage). The function must stay self-contained: it is serialised into the page.
+function pointerAction(kind, resultKey) {
+  return async ({ tabId, selector, text, x, y }) => {
+    assertHasTarget({ selector, text, x, y });
+    assertValidCoordPair(x, y);
+    const tid = await resolveTabId({ tabId });
+    const out = await executeInTab(tid, pointerActionInPage, [kind, selector, text, x, y]);
+    if (out && out.tag && !out.error) {
+      const { tag, ...rest } = out;
+      return { [resultKey]: tag, ...rest };
     }
-    if (!el) return { error: 'Element not found' };
-    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-    return { clicked: el.tagName, text: el.textContent?.trim()?.slice(0, 50) };
-  }, [selector, text, x, y]);
+    return out;
+  };
 }
 
-async function actionDoubleClick({ tabId, selector, text, x, y }) {
-  assertHasTarget({ selector, text, x, y });
-  assertValidCoordPair(x, y);
-  const tid = await resolveTabId({ tabId });
-  return executeInTab(tid, (sel, txt, cx, cy) => {
-    let el;
-    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
-    else if (sel) el = document.querySelector(sel);
-    else if (txt) {
-      const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
-      for (const e of semantic) { if (e.textContent?.trim()?.includes(txt)) { el = e; break; } }
-      if (!el) for (const e of document.querySelectorAll('*')) {
-        if (e.children.length < 3 && e.textContent?.trim()?.includes(txt)) { el = e; break; }
-      }
-    }
-    if (!el) return { error: 'Element not found' };
-    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, detail: 2 }));
-    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, detail: 2 }));
-    el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, detail: 2 }));
-    return { doubleClicked: el.tagName };
-  }, [selector, text, x, y]);
-}
+const actionClick = pointerAction('click', 'clicked');
+const actionDoubleClick = pointerAction('double', 'doubleClicked');
+const actionTripleClick = pointerAction('triple', 'tripleClicked');
+const actionRightClick = pointerAction('right', 'rightClicked');
+const actionHover = pointerAction('hover', 'hovered');
 
-async function actionTripleClick({ tabId, selector, text, x, y }) {
-  assertHasTarget({ selector, text, x, y });
-  assertValidCoordPair(x, y);
-  const tid = await resolveTabId({ tabId });
-  return executeInTab(tid, (sel, txt, cx, cy) => {
-    let el;
-    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
-    else if (sel) el = document.querySelector(sel);
-    else if (txt) {
-      const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
-      for (const e of semantic) { if (e.textContent?.trim()?.includes(txt)) { el = e; break; } }
-      if (!el) for (const e of document.querySelectorAll('*')) {
-        if (e.children.length < 3 && e.textContent?.trim()?.includes(txt)) { el = e; break; }
-      }
-    }
-    if (!el) return { error: 'Element not found' };
-    // Real triple-clicks fire three click events with an incrementing
-    // `detail` (the UI Events click-count), each preceded by its own
-    // mousedown/mouseup — not one click with detail=3.
-    for (let i = 1; i <= 3; i++) {
-      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, detail: i }));
-      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, detail: i }));
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: i }));
-    }
-    return { tripleClicked: el.tagName };
-  }, [selector, text, x, y]);
-}
+/**
+ * Runs IN THE PAGE. Finds the target (selector, coordinates, or visible text), performs the
+ * pointer action, and describes what was hit.
+ *
+ * Text resolution prefers interactive targets and never clicks a container:
+ *   1. a control whose accessible name matches (aria-label, aria-labelledby, an associated
+ *      <label> via for= or wrapping, button/link text, input value/alt/title/placeholder),
+ *      and the control of a matching <label>;
+ *   2. otherwise a leaf element (no child elements) whose text matches, for script-driven targets.
+ * Exact matches (case-insensitive, whitespace-normalised) beat substring matches. A match that
+ * contains another match is dropped in favour of the more specific one. Several remaining
+ * matches are an ambiguity error, none is "Element not found".
+ * @returns {object} { tag, text, element:{tag,role,name,selector}, checked? } or { error }
+ */
+function pointerActionInPage(kind, sel, txt, cx, cy) {
+  const norm = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  // The element list is only built when needed (text resolution, describing the result).
+  let allCache = null;
+  const getAll = () => {
+    if (allCache) return allCache;
+    allCache = [];
+    const root = document.documentElement || document.body;
+    (function collect(n) { for (const c of (n && n.children) || []) { if (c.nodeType === 1) { allCache.push(c); collect(c); } } })(root);
+    return allCache;
+  };
+  const byId = (id) => getAll().find((e) => e.id === id) || null;
+  const attr = (e, n) => (typeof e.getAttribute === 'function' ? e.getAttribute(n) : null);
+  const tagOf = (e) => String(e.tagName || '').toUpperCase();
+  const inputType = (e) => String(attr(e, 'type') || e.type || (tagOf(e) === 'INPUT' ? 'text' : '')).toLowerCase();
 
-async function actionRightClick({ tabId, selector, text, x, y }) {
-  assertHasTarget({ selector, text, x, y });
-  assertValidCoordPair(x, y);
-  const tid = await resolveTabId({ tabId });
-  return executeInTab(tid, (sel, txt, cx, cy) => {
-    let el;
-    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
-    else if (sel) el = document.querySelector(sel);
-    else if (txt) {
-      const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
-      for (const e of semantic) { if (e.textContent?.trim()?.includes(txt)) { el = e; break; } }
-      if (!el) for (const e of document.querySelectorAll('*')) {
-        if (e.children.length < 3 && e.textContent?.trim()?.includes(txt)) { el = e; break; }
+  const INTERACTIVE_ROLES = ['button', 'link', 'checkbox', 'radio', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'switch', 'option', 'combobox', 'textbox'];
+  function isVisible(e) {
+    if (e.hidden === true) return false;
+    try {
+      if (typeof e.getClientRects === 'function' && e.getClientRects().length === 0) return false;
+      if (typeof getComputedStyle === 'function') {
+        const st = getComputedStyle(e);
+        if (st && (st.visibility === 'hidden' || st.display === 'none')) return false;
       }
+    } catch (err) { /* treat as visible */ }
+    return true;
+  }
+  function isInteractive(e) {
+    const t = tagOf(e);
+    if (t === 'A') return attr(e, 'href') !== null;
+    if (t === 'INPUT') return inputType(e) !== 'hidden';
+    if (['BUTTON', 'SELECT', 'TEXTAREA', 'SUMMARY'].includes(t)) return true;
+    if (INTERACTIVE_ROLES.includes(String(attr(e, 'role') || '').toLowerCase())) return true;
+    if (attr(e, 'onclick') !== null) return true;
+    const ti = attr(e, 'tabindex');
+    return ti !== null && Number(ti) >= 0;
+  }
+  let labelsCache = null;
+  const getLabels = () => labelsCache || (labelsCache = getAll().filter((e) => tagOf(e) === 'LABEL'));
+  function controlOf(label) {
+    const f = attr(label, 'for');
+    if (f) return byId(f);
+    const stack = [...(label.children || [])];
+    while (stack.length) {
+      const c = stack.shift();
+      if (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(tagOf(c)) && inputType(c) !== 'hidden') return c;
+      stack.push(...(c.children || []));
     }
-    if (!el) return { error: 'Element not found' };
-    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 2 }));
-    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, button: 2 }));
-    el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }));
-    return { rightClicked: el.tagName };
-  }, [selector, text, x, y]);
-}
+    return null;
+  }
+  function labelsFor(e) {
+    return getLabels().filter((l) => controlOf(l) === e);
+  }
+  function nameOf(e) {
+    const aria = norm(attr(e, 'aria-label'));
+    if (aria) return aria;
+    const by = attr(e, 'aria-labelledby');
+    if (by) {
+      const joined = norm(by.split(/\s+/).map((id) => { const r = byId(id); return r ? r.textContent : ''; }).join(' '));
+      if (joined) return joined;
+    }
+    const t = tagOf(e);
+    if (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(t)) {
+      const fromLabels = norm(labelsFor(e).map((l) => l.textContent).join(' '));
+      if (fromLabels) return fromLabels;
+    }
+    if (t === 'INPUT') {
+      const ty = inputType(e);
+      if (['submit', 'button', 'reset'].includes(ty)) return norm(attr(e, 'value') || e.value || (ty === 'submit' ? 'Submit' : ty === 'reset' ? 'Reset' : ''));
+      if (ty === 'image') return norm(attr(e, 'alt'));
+      return norm(attr(e, 'title') || attr(e, 'placeholder'));
+    }
+    return norm(e.textContent) || norm(attr(e, 'title'));
+  }
+  function roleOf(e) {
+    const r = attr(e, 'role');
+    if (r) return String(r).toLowerCase();
+    const t = tagOf(e);
+    if (t === 'A') return 'link';
+    if (t === 'BUTTON') return 'button';
+    if (t === 'SELECT') return 'combobox';
+    if (t === 'TEXTAREA') return 'textbox';
+    if (t === 'INPUT') {
+      const ty = inputType(e);
+      if (ty === 'checkbox') return 'checkbox';
+      if (ty === 'radio') return 'radio';
+      if (['submit', 'button', 'reset', 'image'].includes(ty)) return 'button';
+      return 'textbox';
+    }
+    return '';
+  }
+  const esc = (v) => (typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(v) : String(v).replace(/[^a-zA-Z0-9_-]/g, '\\$&'));
+  function selectorOf(e) {
+    const stable = (n) => n.id && n.id.length <= 64 && !/\d{4,}/.test(n.id) && n.id.indexOf(':') === -1 && getAll().filter((o) => o.id === n.id).length === 1;
+    const segs = [];
+    let n = e;
+    while (n && n.nodeType === 1) {
+      if (stable(n)) { segs.unshift('#' + esc(n.id)); return segs.join(' > '); }
+      const t = tagOf(n).toLowerCase();
+      if (t === 'body') { segs.unshift('body'); return segs.join(' > '); }
+      if (t === 'html' || !n.parentElement) break;
+      const same = Array.prototype.filter.call(n.parentElement.children, (c) => c.tagName === n.tagName);
+      segs.unshift(t + ':nth-of-type(' + (same.indexOf(n) + 1) + ')');
+      n = n.parentElement;
+    }
+    return segs.join(' > ');
+  }
+  const describe = (e) => ({ tag: tagOf(e).toLowerCase(), role: roleOf(e) || null, name: nameOf(e).slice(0, 100), selector: selectorOf(e) });
+  const isChecked = (e) => {
+    const t = tagOf(e);
+    if (t === 'INPUT' && ['checkbox', 'radio'].includes(inputType(e))) return !!e.checked;
+    const r = roleOf(e);
+    if (r === 'checkbox' || r === 'radio' || r === 'switch') return attr(e, 'aria-checked') === 'true';
+    return null;
+  };
 
-async function actionHover({ tabId, selector, text, x, y }) {
-  assertHasTarget({ selector, text, x, y });
-  assertValidCoordPair(x, y);
-  const tid = await resolveTabId({ tabId });
-  return executeInTab(tid, (sel, txt, cx, cy) => {
-    let el;
-    if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
-    else if (sel) el = document.querySelector(sel);
-    else if (txt) {
-      const semantic = document.querySelectorAll('a, button, [role=button], [role=link], input[type=submit]');
-      for (const e of semantic) { if (e.textContent?.trim()?.includes(txt)) { el = e; break; } }
-      if (!el) for (const e of document.querySelectorAll('*')) {
-        if (e.children.length < 3 && e.textContent?.trim()?.includes(txt)) { el = e; break; }
+  let el = null;
+  if (cx != null && cy != null) el = document.elementFromPoint(cx, cy);
+  else if (sel) el = document.querySelector(sel);
+  else if (txt) {
+    const want = norm(txt).toLowerCase();
+    const interactive = getAll().filter((e) => isInteractive(e) && isVisible(e));
+    const tiers = [(s) => s.toLowerCase() === want, (s) => s.toLowerCase().includes(want)];
+    let matches = [];
+    for (const test of tiers) {
+      const found = new Set();
+      for (const e of interactive) if (test(nameOf(e))) found.add(e);
+      for (const l of getLabels()) {
+        if (!test(norm(l.textContent))) continue;
+        const c = controlOf(l);
+        if (c && interactive.includes(c)) found.add(c);
+      }
+      matches = [...found];
+      // a match containing another match is a container of it: keep the more specific one
+      matches = matches.filter((m) => !matches.some((o) => o !== m && m.contains && m.contains(o)));
+      if (matches.length) break;
+    }
+    if (!matches.length) {
+      // script-driven targets: a leaf element (no child elements) with matching text
+      const leaves = getAll().filter((e) => !(e.children && e.children.length) && isVisible(e) && !isInteractive(e) && norm(e.textContent));
+      for (const test of tiers) {
+        matches = leaves.filter((e) => test(norm(e.textContent)));
+        if (matches.length) break;
       }
     }
-    if (!el) return { error: 'Element not found' };
-    // Fire mouseout/mouseleave on whatever we last hovered, so a
-    // sequence of hover calls behaves like real pointer movement rather
-    // than leaving every previous target stuck in a ":hover"-like state.
-    if (window.__clawserLastHovered && window.__clawserLastHovered !== el) {
-      window.__clawserLastHovered.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
-      window.__clawserLastHovered.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true }));
+    if (!matches.length) return { error: `Element not found: no clickable element matches the text "${norm(txt)}"` };
+    const enabled = matches.filter((m) => !m.disabled);
+    if (enabled.length) matches = enabled;
+    if (matches.length > 1) {
+      const list = matches.slice(0, 5).map((m) => `${selectorOf(m)} (${tagOf(m).toLowerCase()} "${nameOf(m).slice(0, 40)}")`).join('; ');
+      return { error: `Ambiguous text "${norm(txt)}": ${matches.length} matches: ${list}. Use a selector to choose one.` };
     }
-    el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-    el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-    window.__clawserLastHovered = el;
-    return { hovered: el.tagName };
-  }, [selector, text, x, y]);
+    el = matches[0];
+    if (el.disabled) return { error: `Element is disabled: ${selectorOf(el)}` };
+  }
+  if (!el) return { error: 'Element not found' };
+
+  const fire = (type, init) => el.dispatchEvent(new MouseEvent(type, Object.assign({ bubbles: true, cancelable: true }, init)));
+  switch (kind) {
+    case 'click':
+      fire('mousedown'); fire('mouseup'); fire('click');
+      break;
+    case 'double':
+      fire('mousedown', { detail: 2 }); fire('mouseup', { detail: 2 }); fire('dblclick', { detail: 2 });
+      break;
+    case 'triple':
+      // Real triple-clicks fire three click events with an incrementing `detail`
+      // (the UI Events click-count), each preceded by its own mousedown/mouseup.
+      for (let i = 1; i <= 3; i++) { fire('mousedown', { detail: i }); fire('mouseup', { detail: i }); fire('click', { detail: i }); }
+      break;
+    case 'right':
+      fire('mousedown', { button: 2 }); fire('mouseup', { button: 2 }); fire('contextmenu', { button: 2 });
+      break;
+    case 'hover':
+      // Fire mouseout/mouseleave on whatever we last hovered, so a sequence of hover calls
+      // behaves like real pointer movement rather than leaving every earlier target "hovered".
+      if (window.__clawserLastHovered && window.__clawserLastHovered !== el) {
+        window.__clawserLastHovered.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+        window.__clawserLastHovered.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true }));
+      }
+      el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+      el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+      window.__clawserLastHovered = el;
+      break;
+    default:
+      return { error: `Unknown pointer action: ${kind}` };
+  }
+  const out = { tag: tagOf(el), text: norm(el.textContent).slice(0, 50), element: describe(el) };
+  const checked = isChecked(el);
+  if (checked !== null) out.checked = checked;
+  return out;
 }
 
 async function actionDrag({ tabId, startSelector, startX, startY, endX, endY }) {

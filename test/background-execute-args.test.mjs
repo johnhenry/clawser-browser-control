@@ -36,7 +36,7 @@ describe('optional arguments reach the page as null, not undefined', () => {
     assert.equal(error, undefined);
     assert.equal(result.clicked, 'BUTTON');
     assert.deepEqual(hit, ['#go']);
-    assert.deepEqual([...calls[0]], ['#go', null, null, null]);
+    assert.deepEqual([...calls[0]], ['click', '#go', null, null, null]);
   });
 
   it('click by coordinates still uses elementFromPoint, and by text still finds the element', async () => {
@@ -44,7 +44,10 @@ describe('optional arguments reach the page as null, not undefined', () => {
     const a = boot({ document: { elementFromPoint: (x, y) => { points.push([x, y]); return el('DIV'); } } });
     assert.equal((await a.send('click', { x: 5, y: 7 })).result.clicked, 'DIV');
     assert.deepEqual(points, [[5, 7]]);
-    const b = boot({ document: { querySelectorAll: () => [el('A', { textContent: ' Go home ' })] } });
+    const link = { nodeType: 1, tagName: 'A', textContent: ' Go home ', children: [], parentElement: null, getAttribute: (n) => (n === 'href' ? '/home' : null), dispatchEvent() {}, contains() { return false; } };
+    const html = { nodeType: 1, tagName: 'HTML', children: [link], getAttribute: () => null };
+    link.parentElement = html;
+    const b = boot({ document: { documentElement: html } });
     assert.equal((await b.send('click', { text: 'Go' })).result.clicked, 'A');
   });
 
