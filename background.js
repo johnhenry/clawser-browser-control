@@ -1540,6 +1540,10 @@ let schedulerBusy = false;
 // killed. {wsId, url, lastSeen} is mirrored to chrome.storage.local so a cold
 // start can still open the workspace in a background tab.
 
+/** Workspace ids. Shared contract with clawser (docs/BROWSER-TASKS.md): /^[A-Za-z0-9_-]{1,80}$/;
+ * clawser generates `ws_<base36>_<4 hex>` and 'default'. */
+const WORKSPACE_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const isWorkspaceId = (v) => typeof v === 'string' && WORKSPACE_ID_RE.test(v);
 const WORKSPACE_REF_KEY = 'workspaceRef';
 
 /** tabId -> { locked, capabilities } as last announced by that tab's workspace_ready / ping reply.
@@ -1593,7 +1597,7 @@ async function loadWorkspaceRef() {
     const stored = (await chrome.storage.local.get(WORKSPACE_REF_KEY))?.[WORKSPACE_REF_KEY];
     if (!stored || typeof stored !== 'object') return;
     const { wsId, url, lastSeen } = stored;
-    if (wsId !== null && (typeof wsId !== 'string' || wsId.length > 100)) return;
+    if (wsId !== null && !isWorkspaceId(wsId)) return;
     if (typeof url !== 'string' || url.length > BTASK_MAX_URL) return;
     if (!isClawserUrl(url, await getCustomOrigin())) return; // origin no longer allowed: do not open it
     if (!lastKnownWorkspaceTab) {
@@ -1615,7 +1619,26 @@ const SYNC_MAX_ROUTINES = 500;
 const SYNC_MAX_NAME = 200;
 const SYNC_MIN_INTERVAL_MS = 60000;
 const SYNC_MAX_INTERVAL_MS = 366 * 24 * 3600 * 1000;
+/** Ids of routines synced from the page. Counterpart: SAFE_ID in clawser
+ * web/clawser-extension-routine-bridge.js (which filters what is sent). Clawser generates
+ * `routine_<n>` (clawser-routines.js) and `btask_<definitionId>` (clawser-btask-monitor.mjs). */
 const SYNC_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
+
+/** Browser-task DEFINITION ids. Shared contract with clawser: ID_RE in
+ * web/clawser-btask-store.mjs (also docs/BROWSER-TASKS.md). The extension never receives a
+ * definition id on its own (a synced routine carries no action payload); it only sees one
+ * embedded in a monitor routine's id, `btask_<definitionId>`. */
+const DEFINITION_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const BTASK_ROUTINE_PREFIX = 'btask_';
+
+function isDefinitionId(v) { return typeof v === 'string' && DEFINITION_ID_RE.test(v); }
+
+/** Routine id of a browser-task monitor: `btask_` + a valid definition id (clawser: routineIdFor). */
+function isBtaskRoutineId(id) {
+  return typeof id === 'string' && id.startsWith(BTASK_ROUTINE_PREFIX) && isDefinitionId(id.slice(BTASK_ROUTINE_PREFIX.length));
+}
+
+
 
 function sanitizeSyncedTrigger(t) {
   if (!t || typeof t !== 'object') return null;
@@ -1639,6 +1662,8 @@ function sanitizeSyncedRoutines(list, wsId) {
   for (const r of Array.isArray(list) ? list : []) {
     if (out.length >= SYNC_MAX_ROUTINES) break;
     if (!r || typeof r !== 'object' || typeof r.id !== 'string' || !SYNC_ID_RE.test(r.id) || seen.has(r.id)) continue;
+    // The btask_ namespace is reserved for monitor routines, whose id embeds a definition id.
+    if (r.id.startsWith(BTASK_ROUTINE_PREFIX) && !isBtaskRoutineId(r.id)) continue;
     const trigger = sanitizeSyncedTrigger(r.trigger);
     if (!trigger) continue;
     seen.add(r.id);
@@ -1662,7 +1687,7 @@ async function handleRoutinesSync(msg, sender) {
   if (tabId === undefined || typeof tabUrl !== 'string') return;
   if (!isClawserUrl(tabUrl, await getCustomOrigin())) return;
   const wsId = msg.wsId;
-  if (typeof wsId !== 'string' || wsId.length < 1 || wsId.length > 100) return;
+  if (!isWorkspaceId(wsId)) return;
   if (!Array.isArray(msg.routines)) return;
 
   rememberWorkspace({ tabId, url: tabUrl, wsId });
@@ -1731,9 +1756,9 @@ function handleNotify(msg, sender) {
 
   if (msg.action === 'workspace_ready') {
     if (tabId !== undefined && tabUrl) {
-      rememberWorkspace({ tabId, url: tabUrl, wsId: msg.wsId || null });
+      rememberWorkspace({ tabId, url: tabUrl, wsId: isWorkspaceId(msg.wsId) ? msg.wsId : null });
       const locked = msg.locked === true;
-      tabLockStates.set(tabId, { locked, capabilities: cleanCapabilities(msg.capabilities), wsId: typeof msg.wsId === 'string' ? msg.wsId : null });
+      tabLockStates.set(tabId, { locked, capabilities: cleanCapabilities(msg.capabilities), wsId: isWorkspaceId(msg.wsId) ? msg.wsId : null });
       if (!locked) setLockedSkip(false);
       const waiter = pendingReadyWaiters.get(tabId);
       if (waiter) { pendingReadyWaiters.delete(tabId); waiter(); }
@@ -1921,7 +1946,7 @@ async function actionRoutineFailures(params, sender) {
   const tab = sender?.tab;
   if (!tab || typeof tab.url !== 'string' || !isClawserUrl(tab.url, await getCustomOrigin())) throw new Error('Not allowed from this page');
   const wsId = params?.wsId;
-  if (typeof wsId !== 'string' || wsId.length < 1 || wsId.length > 100) throw new Error('wsId is required');
+  if (!isWorkspaceId(wsId)) throw new Error('wsId is required');
   if (tabLockStates.get(tab.id)?.wsId !== wsId) throw new Error('Unknown workspace for this tab');
   const since = typeof params.since === 'number' && Number.isFinite(params.since) ? params.since : 0;
 
