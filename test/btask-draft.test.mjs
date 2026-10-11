@@ -78,6 +78,14 @@ describe('btask_draft from the side panel', () => {
     assert.equal(sent[0].msg.request.origin, 'sidepanel');
   });
 
+  it('accepts kind "monitor" (Watch page) and forwards it unchanged', async () => {
+    const { b, sent } = setup();
+    const r = await b.sendUi({ action: 'btask_draft', kind: 'monitor', sources: [tabSource(NEWS_TAB)] }, PANEL);
+    assert.equal(r.result.ok, true);
+    assert.equal(sent[0].msg.request.kind, 'monitor');
+    assert.equal(sent[0].msg.request.origin, 'sidepanel');
+  });
+
   it('rejects an unknown kind, no sources, too many sources, and non-http(s) tabs', async () => {
     const { b, sent } = setup({ tabs: [CLAWSER_TAB, NEWS_TAB, { id: 13, windowId: 7, url: 'chrome://extensions', title: 'x' }] });
     const bad = [

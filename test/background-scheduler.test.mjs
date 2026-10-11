@@ -149,7 +149,17 @@ describe('scheduler: trigger types', () => {
   });
 
   it('fires a "once" routine exactly once, then never again', async () => {
-    const { fireAlarm, idbStore } = loadBackground();
+    // A live tab that runs it successfully. (A FAILED one-shot is retried with backoff
+    // instead; see background-retry-failures.test.mjs.)
+    let b;
+    b = loadBackground({
+      tabs: {
+        get: async (id) => ({ id, windowId: 1, url: 'https://clawser.example/#workspace/ws1' }),
+        sendMessage: async (tabId, msg) => { setTimeout(() => b.notify('routine_executed', { routineId: msg.routineId, success: true, error: null }, { tab: { id: tabId } }), 2); },
+      },
+    });
+    b.notify('workspace_ready', { wsId: 'ws1' }, { tab: { id: 5, url: 'https://clawser.example/#workspace/ws1' } });
+    const { fireAlarm, idbStore } = b;
     idbStore.set('background_routine_state', [
       routine({ trigger: {}, meta: { scheduleType: 'once', fireAt: Date.now() - 1000 } }),
     ]);

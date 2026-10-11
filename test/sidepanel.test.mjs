@@ -95,15 +95,32 @@ describe('side panel: tasks, inbox, last run', () => {
 });
 
 describe('side panel: entry actions', () => {
-  it('Watch page and Create workflow only report that they are not available yet', async () => {
+  it('Create workflow only reports that it is not available yet', async () => {
     const p = loadSidepanel({ tabs: TABS, respond: connected });
     await p.tick(); await p.tick();
     p.sentMessages.length = 0;
-    p.$('btn-watch').click();
-    assert.match(p.$('status').textContent, /later release/i);
     p.$('btn-workflow').click();
     assert.match(p.$('status').textContent, /later release/i);
     assert.equal(p.sentMessages.length, 0);
+  });
+
+  it('Watch page is live: single tab choice, preselects the active tab, sends a monitor draft', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: connected });
+    await p.tick(); await p.tick();
+    assert.equal(p.$('btn-watch').getAttribute('aria-disabled'), null);
+    p.$('btn-watch').click(); await p.tick();
+    assert.equal(p.$('picker').hidden, false);
+    assert.equal(p.$('picker-title').textContent, 'Watch page');
+    const radios = p.$('tab-options').find((e) => e.attrs.type === 'radio');
+    assert.equal(radios.length, 3);
+    assert.equal(radios[0].checked, true);
+    p.sentMessages.length = 0;
+    p.$('btn-send').click(); await p.tick(); await p.tick();
+    const draft = p.sentMessages.find((m) => m.action === 'btask_draft');
+    assert.equal(draft.kind, 'monitor');
+    assert.deepEqual(JSON.parse(JSON.stringify(draft.sources)), [{ kind: 'tab', tabId: 1 }]);
+    assert.match(p.$('status').textContent, /Clawser has your draft/);
+    assert.equal(p.doc.focused, p.$('btn-watch'));
   });
 
   it('Compare lists only http(s) tabs with title and URL, and needs two selections', async () => {
@@ -209,6 +226,41 @@ describe('side panel: entry actions', () => {
   });
 });
 
+describe('side panel: inbox shows kinds distinctly, in text', () => {
+  const notes = [
+    { id: 'n1', kind: 'change', at: '2026-10-10T10:00:00Z', title: 'Price: dropped below 50', body: '- 55 + 49', read: false },
+    { id: 'n2', kind: 'attention', at: '2026-10-10T09:00:00Z', title: 'Price needs attention', body: 'login required', read: false },
+    { id: 'n3', kind: 'run_finished', at: '2026-10-10T08:00:00Z', title: 'Compare done', body: '', read: true },
+    { id: 'n4', kind: 'weird', at: '', title: 'Other', body: '', read: true },
+  ];
+  const respond = (m) => (m.action === 'btask_inbox' ? { result: { connected: true, notifications: notes } } : connected(m));
+
+  it('labels each kind with words, not colour', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond });
+    await p.tick(); await p.tick();
+    const items = p.$('inbox-list').children;
+    assert.match(items[0].textContent, /^Change detected: Price: dropped below 50/);
+    assert.match(items[1].textContent, /^Needs attention: Price needs attention/);
+    assert.match(items[2].textContent, /^Run finished: Compare done/);
+    assert.match(items[3].textContent, /^Other/);
+  });
+
+  it('counts change and attention separately in the summary', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond });
+    await p.tick(); await p.tick();
+    const t = p.$('inbox-state').textContent;
+    assert.match(t, /4 messages/);
+    assert.match(t, /1 change/);
+    assert.match(t, /1 needs attention/);
+  });
+
+  it('shows the body text of a change', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond });
+    await p.tick(); await p.tick();
+    assert.match(p.$('inbox-list').children[0].textContent, /- 55 \+ 49/);
+  });
+});
+
 describe('side panel: notice (undelivered draft / capture fallback)', () => {
   const undelivered = { kind: 'undelivered', message: "Couldn't send to clawser: open clawser and try again", detail: null, canRetry: true, draftKind: 'extract', sources: [{ title: 'Shop', url: 'https://s.example.com/' }] };
   const base = (notice, extra = {}) => (m) => (m.action === 'btask_notice' ? { result: { notice } } : (extra[m.action] ? extra[m.action](m) : connected(m)));
@@ -309,5 +361,22 @@ describe('side panel: keyboard focus survives toggling (real-browser bug)', () =
     assert.equal(radios[0].checked, false);
     assert.equal(radios[1].checked, true);
     assert.equal(p.doc.focused, radios[1]);
+  });
+});
+
+describe('side panel: scheduler lock status', () => {
+  const respondWith = (lockedSkipped) => (m) => (m.action === 'btask_sched_status' ? { result: { lockedSkipped } } : connected(m));
+
+  it('says "Clawser is locked: open it to run scheduled routines" when routines were skipped for being locked', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: respondWith(true) });
+    await p.tick(); await p.tick();
+    assert.equal(p.$('sched-status').hidden, false);
+    assert.equal(p.$('sched-status').textContent, 'Clawser is locked: open it to run scheduled routines');
+  });
+
+  it('is hidden otherwise', async () => {
+    const p = loadSidepanel({ tabs: TABS, respond: respondWith(false) });
+    await p.tick(); await p.tick();
+    assert.equal(p.$('sched-status').hidden, true);
   });
 });
