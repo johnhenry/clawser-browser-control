@@ -34,6 +34,10 @@ alarms
 ------
 Required to periodically check whether a scheduled Clawser routine is due to run, so routines can still fire on a schedule even when no Clawser tab is currently open.
 
+offscreen
+---------
+Required to encode GIF recordings of the user's tab. A Manifest V3 service worker has no DOM or canvas, so the extension decodes the captured frames and encodes the GIF in a hidden offscreen document. It is created only while a recording the user started is being encoded, shows nothing, and does not access web pages or send data anywhere.
+
 sidePanel
 ---------
 Required to show the Clawser browser-tasks panel beside the page: four task launchers, a picker for the open tabs the user chooses, and the user's saved tasks, inbox and last-run status, which are read from their own Clawser tab. The panel only prepares drafts; nothing runs until the user confirms in Clawser.
