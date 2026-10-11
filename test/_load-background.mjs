@@ -83,7 +83,7 @@ export function makeFakeIndexedDB(store = new Map()) {
 }
 
 export function loadBackground(chromeOverrides = {}, opts = {}) {
-  const hooks = { listener: null, alarmListener: null, installedListener: null, startupListener: null, menuListener: null };
+  const hooks = { listener: null, alarmListener: null, installedListener: null, startupListener: null, menuListener: null, tabUpdatedListener: null };
   const menusCreated = []; // chrome.contextMenus.create() props, in order
   const registered = []; // chrome.scripting.registerContentScripts() entries currently registered
   const localStore = { ...(opts.storage || {}) }; // chrome.storage.local backing object
@@ -108,6 +108,7 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
     tabs: {
       query: async () => [{ id: 1, url: 'https://example.com', active: true }],
       onRemoved: { addListener: () => {} },
+      onUpdated: { addListener: (fn) => { hooks.tabUpdatedListener = fn; } },
       get: async (id) => ({ id, windowId: 1, url: 'https://example.com' }),
       update: async () => ({ id: 1, windowId: 1 }),
       create: async (opts) => ({ id: 999, url: opts.url, title: '' }),
@@ -237,8 +238,11 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   /** Fire runtime.onInstalled. */
   function install() { return hooks.installedListener?.({ reason: 'install' }); }
 
+  /** Simulate chrome.tabs.onUpdated. */
+  function tabUpdated(tabId, changeInfo, tab = { id: tabId }) { return hooks.tabUpdatedListener?.(tabId, changeInfo, tab); }
+
   /** Simulate a context-menu click. */
   function clickMenu(info, tab) { return hooks.menuListener?.(info, tab); }
 
-  return { sandbox, send, sendUi, install, clickMenu, notify, fireAlarm, chrome: chromeStub, idbStore, pageIdb, pageSync, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
+  return { sandbox, send, sendUi, install, clickMenu, tabUpdated, notify, fireAlarm, chrome: chromeStub, idbStore, pageIdb, pageSync, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
 }

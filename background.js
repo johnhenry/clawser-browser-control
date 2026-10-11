@@ -1866,31 +1866,55 @@ async function delegateRoutineExecution(routineId, timeoutMs = ROUTINE_EXEC_TIME
     return { success: false, error: 'No known Clawser tab to execute this routine on (no live workspace has ever connected)' };
   }
 
-  let openedTab;
+  // Write an "attempt started" record BEFORE the long wait: if this worker is killed meanwhile,
+  // the next alarm finds it and records the failure (recoverOrphanedAttempts).
+  const attempt = await startAttempt(routineId, lastKnownWorkspaceTab.wsId, lastKnownWorkspaceTab.url);
+  let openedTab = null;
   try {
-    openedTab = await chrome.tabs.create({ url: lastKnownWorkspaceTab.url, active: false });
-  } catch (e) {
-    return { success: false, error: `Could not open a tab to run this routine: ${e.message}` };
+    try {
+      openedTab = await chrome.tabs.create({ url: lastKnownWorkspaceTab.url, active: false });
+    } catch (e) {
+      return { success: false, error: `Could not open a tab to run this routine: ${e.message}` };
+    }
+    schedulerOwnedTabs.add(openedTab.id);
+    await setAttemptTab(attempt, openedTab.id);
+
+    // The FIRST workspace_ready counts: a vault user's tab announces itself as locked (with the
+    // btask_monitor capability) before the passphrase is entered, and that is enough for monitors.
+    // A navigation error (DNS / connection failure) ends the wait at once.
+    const outcome = await new Promise((resolve) => {
+      const timer = setTimeout(() => { pendingReadyWaiters.delete(openedTab.id); pendingNavErrors.delete(openedTab.id); resolve('timeout'); }, TAB_OPEN_WAIT_MS);
+      pendingReadyWaiters.set(openedTab.id, () => { clearTimeout(timer); pendingNavErrors.delete(openedTab.id); resolve('ready'); });
+      pendingNavErrors.set(openedTab.id, () => { clearTimeout(timer); pendingReadyWaiters.delete(openedTab.id); pendingNavErrors.delete(openedTab.id); resolve('nav_error'); });
+    });
+
+    if (outcome === 'timeout') return { success: false, error: 'Opened a tab but it did not report ready in time' };
+    if (outcome === 'nav_error') return { success: false, error: `Could not load Clawser at ${new URL(lastKnownWorkspaceTab.url).origin}: the page failed to load (navigation error)` };
+    if (!tabAdmits(tabLockStates.get(openedTab.id), isMonitor)) return lockedResult();
+    return await requestRoutineExecution(openedTab.id, routineId, timeoutMs);
+  } finally {
+    if (openedTab) {
+      try { await chrome.tabs.remove(openedTab.id); } catch { /* best-effort cleanup */ }
+      schedulerOwnedTabs.delete(openedTab.id);
+      tabLockStates.delete(openedTab.id);
+      pendingNavErrors.delete(openedTab.id);
+    }
+    await finishAttempt(attempt);
   }
-  schedulerOwnedTabs.add(openedTab.id);
-
-  // The FIRST workspace_ready counts: a vault user's tab announces itself as locked (with the
-  // btask_monitor capability) before the passphrase is entered, and that is enough for monitors.
-  const ready = await new Promise((resolve) => {
-    const timer = setTimeout(() => { pendingReadyWaiters.delete(openedTab.id); resolve(false); }, TAB_OPEN_WAIT_MS);
-    pendingReadyWaiters.set(openedTab.id, () => { clearTimeout(timer); resolve(true); });
-  });
-
-  let result;
-  if (!ready) result = { success: false, error: 'Opened a tab but it did not report ready in time' };
-  else if (!tabAdmits(tabLockStates.get(openedTab.id), isMonitor)) result = lockedResult();
-  else result = await requestRoutineExecution(openedTab.id, routineId, timeoutMs);
-
-  try { await chrome.tabs.remove(openedTab.id); } catch { /* best-effort cleanup */ }
-  schedulerOwnedTabs.delete(openedTab.id);
-  tabLockStates.delete(openedTab.id);
-  return result;
 }
+
+/** tabId -> callback, for scheduler-opened tabs still waiting to connect: ends the wait on a navigation error. */
+const pendingNavErrors = new Map();
+
+// Fail fast: an unreachable host leaves the tab on Chrome's error page, which never runs content
+// scripts, so the page would otherwise be waited for the full TAB_OPEN_WAIT_MS. Uses
+// tabs.onUpdated (the existing "tabs" permission); no webNavigation permission.
+chrome.tabs.onUpdated?.addListener((tabId, changeInfo, tab) => {
+  const cb = pendingNavErrors.get(tabId);
+  if (!cb) return;
+  const url = changeInfo?.url || tab?.url || '';
+  if (typeof url === 'string' && url.startsWith('chrome-error://')) cb();
+});
 
 // Cron field-range validation, ported from web/clawser-background-runner.js's
 // validateCronExpression() (can't import it — no ES modules in an MV3
@@ -1921,6 +1945,173 @@ function validateCronExpressionInline(expr) {
   const parts = expr.trim().split(/\s+/);
   if (parts.length !== 5) return false;
   return parts.every((p, i) => validateCronFieldRange(p, CRON_FIELD_RANGES[i][0], CRON_FIELD_RANGES[i][1]));
+}
+
+// ── Run outcomes, attempt records ────────────────────────────────
+
+const CHECKPOINT_DB = 'clawser_checkpoints';
+const CHECKPOINT_STORE = 'checkpoints';
+const ROUTINES_KEY = 'background_routine_state';
+const EXEC_LOG_KEY = 'background_execution_log';
+/** "Attempt started" records: written before waiting on a background tab, removed when the
+ * attempt finishes. One left behind means the worker died mid-attempt (see recoverOrphanedAttempts). */
+const ATTEMPTS_KEY = 'background_routine_attempts';
+
+/** Attempts this worker instance is running right now. A record that is not in here belongs to a dead worker. */
+const activeAttempts = new Set();
+const attemptKey = (a) => `${a.routineId}@${a.at}`;
+
+function openCheckpointDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(CHECKPOINT_DB, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(CHECKPOINT_STORE)) req.result.createObjectStore(CHECKPOINT_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/** Atomically read-modify-write one key in a single readwrite transaction. */
+async function idbMutate(key, fn) {
+  const db = await openCheckpointDb();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(CHECKPOINT_STORE, 'readwrite');
+      const store = tx.objectStore(CHECKPOINT_STORE);
+      const get = store.get(key);
+      get.onsuccess = () => store.put(fn(get.result), key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
+    });
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
+}
+
+/** Record that an attempt is starting, BEFORE the long wait, so a killed worker leaves a trace. */
+async function startAttempt(routineId, wsId, url) {
+  const attempt = { routineId, wsId: wsId ?? null, at: Date.now(), tabId: null, url };
+  activeAttempts.add(attemptKey(attempt));
+  try { await idbMutate(ATTEMPTS_KEY, (cur) => [...(Array.isArray(cur) ? cur : []), attempt]); } catch { /* best-effort */ }
+  return attempt;
+}
+
+async function setAttemptTab(attempt, tabId) {
+  attempt.tabId = tabId;
+  try {
+    await idbMutate(ATTEMPTS_KEY, (cur) => (Array.isArray(cur) ? cur : []).map((a) => (attemptKey(a) === attemptKey(attempt) ? { ...a, tabId } : a)));
+  } catch { /* best-effort */ }
+}
+
+/** The attempt finished (in any way): drop its record. */
+async function finishAttempt(attempt) {
+  activeAttempts.delete(attemptKey(attempt));
+  try { await idbMutate(ATTEMPTS_KEY, (cur) => (Array.isArray(cur) ? cur : []).filter((a) => attemptKey(a) !== attemptKey(attempt))); } catch { /* best-effort */ }
+}
+
+/**
+ * Apply what a batch of runs owns onto the CURRENT stored routines, in one readwrite
+ * transaction (the page may have added, paused, edited or deleted routines meanwhile):
+ * run bookkeeping, failure backoff, the failure list and the execution log. `clearAttempts`
+ * are attempt records to remove in the same transaction.
+ */
+async function applyRunOutcomes(db, ran, results, now, clearAttempts = []) {
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(CHECKPOINT_STORE, 'readwrite');
+    const store = tx.objectStore(CHECKPOINT_STORE);
+    const getRoutines = store.get(ROUTINES_KEY);
+    getRoutines.onsuccess = () => {
+      const current = Array.isArray(getRoutines.result) ? getRoutines.result : [];
+      const newFailures = [];
+      for (const o of ran) {
+        const cur = current.find((c) => c && c.id === o.id);
+        if (!cur) continue; // deleted meanwhile: never bring it back
+        cur.state = cur.state || {};
+        cur.state.lastRun = o.lastRun;
+        cur.state.lastResult = o.lastResult;
+        cur.state.runCount = (cur.state.runCount || 0) + 1;
+        if (o.failed) {
+          // Do not advance the schedule: retry at the next due attempt, with backoff.
+          cur.state.failures = (cur.state.failures || 0) + 1;
+          cur.state.retryAt = o.lastRun + retryDelayMs(cur.state.failures, cur);
+          if (typeof cur.wsId === 'string') newFailures.push({ wsId: cur.wsId, routineId: cur.id, at: o.lastRun, error: o.error });
+          continue;
+        }
+        delete cur.state.failures;
+        delete cur.state.retryAt;
+        if (o.lastCronMinute !== null) cur.state.lastCronMinute = o.lastCronMinute;
+        if (cur.meta && o.interval) cur.meta.lastFired = now;
+        if (cur.meta && o.once) cur.meta.fired = true;
+      }
+      store.put(current, ROUTINES_KEY);
+      if (newFailures.length) {
+        const getFail = store.get(FAILURES_KEY);
+        getFail.onsuccess = () => {
+          const list = Array.isArray(getFail.result) ? getFail.result : [];
+          list.push(...newFailures);
+          while (list.length > FAILURES_MAX) list.shift();
+          store.put(list, FAILURES_KEY);
+        };
+      }
+      if (clearAttempts.length) {
+        const gone = new Set(clearAttempts.map(attemptKey));
+        const getAttempts = store.get(ATTEMPTS_KEY);
+        getAttempts.onsuccess = () => {
+          const list = Array.isArray(getAttempts.result) ? getAttempts.result : [];
+          store.put(list.filter((a) => !gone.has(attemptKey(a))), ATTEMPTS_KEY);
+        };
+      }
+      const getLog = store.get(EXEC_LOG_KEY);
+      getLog.onsuccess = () => {
+        const log = Array.isArray(getLog.result) ? getLog.result : [];
+        log.push({ timestamp: now, results });
+        while (log.length > 100) log.shift();
+        store.put(log, EXEC_LOG_KEY);
+      };
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
+  });
+}
+
+/**
+ * A worker that was killed mid-attempt (e.g. during the 60 s tab-open wait) leaves an "attempt
+ * started" record and maybe a tab. Anything not running in THIS worker is orphaned: close the
+ * leftover tab if it is still ours, and record the attempt as a failure (execution log, backoff,
+ * routine_failures) so it is never lost silently.
+ */
+async function recoverOrphanedAttempts(db) {
+  const attempts = await new Promise((resolve) => {
+    const r = db.transaction(CHECKPOINT_STORE, 'readonly').objectStore(CHECKPOINT_STORE).get(ATTEMPTS_KEY);
+    r.onsuccess = () => resolve(Array.isArray(r.result) ? r.result : []);
+    r.onerror = () => resolve([]);
+  });
+  const orphans = attempts.filter((a) => a && typeof a.routineId === 'string' && !activeAttempts.has(attemptKey(a)));
+  if (orphans.length === 0) return;
+
+  const custom = await getCustomOrigin();
+  for (const a of orphans) {
+    if (!Number.isInteger(a.tabId)) continue;
+    try {
+      const tab = await chrome.tabs.get(a.tabId);
+      // Only close a tab that is still on a clawser origin: the id may have been reused.
+      if (tab && isClawserUrl(tab.url || tab.pendingUrl || '', custom)) await chrome.tabs.remove(a.tabId);
+    } catch { /* already gone */ }
+  }
+
+  const now = Date.now();
+  const message = 'attempt interrupted: the extension stopped before the Clawser tab connected';
+  const byRoutine = new Map();
+  for (const a of orphans) byRoutine.set(a.routineId, a); // one failure per routine
+  const ran = []; const results = [];
+  for (const a of byRoutine.values()) {
+    ran.push({ id: a.routineId, lastRun: now, lastResult: `skipped: ${message}`, lastCronMinute: null, interval: false, once: false, failed: true, error: message });
+    results.push({ routineId: a.routineId, success: false, error: message, recovered: true, startedAt: a.at, nextRetryAt: null });
+  }
+  await applyRunOutcomes(db, ran, results, now, orphans);
 }
 
 // ── Retry backoff and recent failures ─────────────────────────────
@@ -2003,6 +2194,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       req.onsuccess = () => resolve(req.result ?? null);
       req.onerror = () => resolve(null);
     });
+
+    await recoverOrphanedAttempts(db);
 
     const routines = await read(ROUTINE_KEY);
     if (!Array.isArray(routines) || routines.length === 0) {
@@ -2112,58 +2305,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       if (!success) console.warn(`[clawser-ext] Routine "${r.name || r.id}" not executed: ${error}`);
     }
 
-    if (results.length > 0) {
-      // One readwrite transaction (get, then put) so the merge is atomic in IDB.
-      await new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE, 'readwrite');
-        const store = tx.objectStore(STORE);
-        const getRoutines = store.get(ROUTINE_KEY);
-        getRoutines.onsuccess = () => {
-          const current = Array.isArray(getRoutines.result) ? getRoutines.result : [];
-          const newFailures = [];
-          for (const o of ran) {
-            const cur = current.find((c) => c && c.id === o.id);
-            if (!cur) continue; // deleted meanwhile: never bring it back
-            cur.state = cur.state || {};
-            cur.state.lastRun = o.lastRun;
-            cur.state.lastResult = o.lastResult;
-            cur.state.runCount = (cur.state.runCount || 0) + 1;
-            if (o.failed) {
-              // Do not advance the schedule: retry at the next due attempt, with backoff.
-              cur.state.failures = (cur.state.failures || 0) + 1;
-              cur.state.retryAt = o.lastRun + retryDelayMs(cur.state.failures, cur);
-              if (typeof cur.wsId === 'string') newFailures.push({ wsId: cur.wsId, routineId: cur.id, at: o.lastRun, error: o.error });
-              continue;
-            }
-            delete cur.state.failures;
-            delete cur.state.retryAt;
-            if (o.lastCronMinute !== null) cur.state.lastCronMinute = o.lastCronMinute;
-            if (cur.meta && o.interval) cur.meta.lastFired = now;
-            if (cur.meta && o.once) cur.meta.fired = true;
-          }
-          store.put(current, ROUTINE_KEY);
-          if (newFailures.length) {
-            const getFail = store.get(FAILURES_KEY);
-            getFail.onsuccess = () => {
-              const list = Array.isArray(getFail.result) ? getFail.result : [];
-              list.push(...newFailures);
-              while (list.length > FAILURES_MAX) list.shift();
-              store.put(list, FAILURES_KEY);
-            };
-          }
-          const getLog = store.get(LOG_KEY);
-          getLog.onsuccess = () => {
-            const log = Array.isArray(getLog.result) ? getLog.result : [];
-            log.push({ timestamp: now, results });
-            while (log.length > 100) log.shift();
-            store.put(log, LOG_KEY);
-          };
-        };
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
-        tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
-      });
-    }
+    if (results.length > 0) await applyRunOutcomes(db, ran, results, now);
 
     db.close();
   } catch (err) {
