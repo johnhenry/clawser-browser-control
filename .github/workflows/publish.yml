@@ -12,7 +12,17 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches both manifest versions
+        # A tag that disagrees with manifest.json would upload a build the store
+        # rejects (same version as the live one) or label the GitHub Release wrongly.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          chrome=$(node -p "require('./manifest.json').version")
+          firefox=$(node -p "require('./firefox/manifest.json').version")
+          echo "tag=$tag chrome=$chrome firefox=$firefox"
+          test "$tag" = "$chrome" && test "$tag" = "$firefox"
 
       - name: Build extension zip
         # File list lives in scripts/dist-files.txt — shared with ci.yml's
@@ -23,10 +33,13 @@ jobs:
           zip -r dist/clawser-browser-control.zip -@ -x "*.DS_Store" < scripts/dist-files.txt
 
       - name: Upload to Chrome Web Store
-        uses: mnao305/chrome-extension-upload@v5.0.0
+        # v7 uses Chrome Web Store API v2 (Google turns API v1 off on 2026-10-15).
+        # The publisher ID is under Publisher > Settings in the Developer Dashboard.
+        uses: mnao305/chrome-extension-upload@v7.0.0
         with:
           file-path: dist/clawser-browser-control.zip
           extension-id: dljchbfodafekojicopaboiegophjcbc
+          publisher-id: ${{ vars.CWS_PUBLISHER_ID }}
           client-id: ${{ secrets.CWS_CLIENT_ID }}
           client-secret: ${{ secrets.CWS_CLIENT_SECRET }}
           refresh-token: ${{ secrets.CWS_REFRESH_TOKEN }}
@@ -48,7 +61,7 @@ jobs:
           (cd dist/firefox-stage && zip -r ../clawser-browser-control-firefox.zip . -x "*.DS_Store")
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/clawser-browser-control.zip
