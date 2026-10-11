@@ -9,7 +9,8 @@ if (window.__clawser_ext_injected) { /* already running */ } else {
 window.__clawser_ext_injected = true;
 
 const MARKER = '__clawser_ext__';
-const VERSION = '0.1.0';
+// Reported to Clawser (presence and status). Read from the manifest so it can't drift from the release.
+const VERSION = (() => { try { return chrome.runtime.getManifest().version; } catch { return '0.0.0'; } })();
 
 console.log('[clawser-ext] content.js loaded on', location.href);
 

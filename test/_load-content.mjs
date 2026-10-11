@@ -72,6 +72,7 @@ export function loadContent(chromeOverrides = {}, opts = {}) {
 
   const defaultRuntime = {
     id: 'fake-extension-id',
+    getManifest: () => ({ version: '9.8.7' }),
     sendMessage: async () => ({}),
     onMessage: { addListener: (fn) => runtimeListeners.push(fn) },
   };

@@ -12,6 +12,12 @@ describe('message routing', () => {
     assert.ok(Array.isArray(result.capabilities));
   });
 
+  it('status reports the manifest version, not a hardcoded one', async () => {
+    const { send } = loadBackground();
+    const { result } = await send('status', {});
+    assert.equal(result.version, '9.8.7'); // the stub's chrome.runtime.getManifest().version
+  });
+
   it('returns a clear error for an unknown action', async () => {
     const { send } = loadBackground();
     const { error } = await send('this_action_does_not_exist', {});
