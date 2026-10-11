@@ -33,6 +33,11 @@ Chrome extension that gives the [Clawser](https://github.com/johnhenry/clawser) 
 - `manifest.json` — Chrome MV3 manifest (minimum Chrome 135)
 - `firefox/manifest.json` — Firefox MV3 manifest (minimum Firefox 128)
 
+## Tool notes
+
+- **`navigate` / `go_back` / `go_forward`** — `navigate` pushes a normal history entry (like following a link) and now waits until the navigation has *committed* (up to 10 s) before it returns `{tabId, url, committed}`; `url` is the committed URL, and `committed:false` means nothing committed in time (the requested URL is reported). Before this, `chrome.tabs.update` returned as soon as the navigation was requested, so a `go_back` straight afterwards found no earlier history entry and Chrome reported its own misleading "Cannot find a next page in history". `go_back` / `go_forward` also wait for their navigation to commit and return `{tabId, direction, url, committed}`. A back/forward/navigate issued while another navigation of the same tab is in flight waits for it. A tab that ends on Chrome's error page makes `navigate` fail with "Navigation failed". With nothing to go back to, the error is "No earlier page in this tab's history to go back to" (forward: "No later page ...").
+- **Pointer actions by text** (`click`, `double_click`, `triple_click`, `right_click`, `hover`) — `text` is resolved to an interactive target, never to a container: a control whose accessible name matches (aria-label, aria-labelledby, an associated `<label>` via `for=` or wrapping, button/link text, input value/alt/title/placeholder), or the control of a matching `<label>`; failing that, a leaf element with matching text. Exact (case-insensitive, whitespace-normalised) matches beat substring matches; several remaining matches return an "Ambiguous text" error listing selectors (use `selector`), and no match returns "Element not found". The result describes what was hit: `{clicked, text, element:{tag, role, name, selector}}`, plus `checked` (the state after the click) for checkboxes and radios.
+
 ## Permissions
 
 Beyond the permissions used for browser control (`tabs`, `activeTab`, `scripting`, `userScripts`, `webRequest`, `cookies`, `storage`, `alarms`, `offscreen`, host access), the browser-tasks feature adds two:

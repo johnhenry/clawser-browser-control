@@ -379,23 +379,85 @@ async function actionTabReload({ tabId }) {
 
 // -- Navigation --
 
+/** How long navigate / back / forward wait for the navigation to commit. */
+const NAV_COMMIT_TIMEOUT_MS = 10000;
+
+/** tabId -> promise of the navigation in flight, so a back/forward/navigate issued meanwhile waits for it. */
+const pendingNavigations = new Map();
+
+/**
+ * Run `trigger` (tabs.update / goBack / goForward) and wait until the tab's navigation COMMITS.
+ * chrome.tabs.update() resolves as soon as the navigation is requested, before the new history
+ * entry exists; a back issued right then found nothing to go back to. Resolves with
+ * { committed, url } ; `url` is the committed URL (or null if it never committed in time).
+ * Rejects if the trigger fails or the tab ends on Chrome's error page.
+ */
+async function navigateAndWait(tid, trigger) {
+  const prior = pendingNavigations.get(tid);
+  if (prior) await prior.catch(() => {});
+
+  const run = (async () => {
+    let finish;
+    const committed = new Promise((resolve) => { finish = resolve; });
+    const listener = (id, info) => {
+      if (id !== tid || !info) return;
+      if (info.url || info.status === 'complete') finish(true);
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    const timer = setTimeout(() => finish(false), NAV_COMMIT_TIMEOUT_MS);
+    try {
+      await trigger();
+      const ok = await committed;
+      let url = null;
+      if (ok) {
+        try { const t = await chrome.tabs.get(tid); url = t.url || t.pendingUrl || null; } catch { /* tab gone */ }
+      }
+      return { committed: ok, url };
+    } finally {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+    }
+  })();
+  pendingNavigations.set(tid, run);
+  try { return await run; } finally { if (pendingNavigations.get(tid) === run) pendingNavigations.delete(tid); }
+}
+
+/**
+ * Navigate a tab and wait for the navigation to commit (history entry created), so back and
+ * forward work immediately afterwards. Pushes a normal history entry, like following a link.
+ * Result: { tabId, url, committed }. committed:false means no commit within 10 s (url is the one asked for).
+ */
 async function actionNavigate({ tabId, url }) {
   if (!url) throw new Error('url is required');
   const tid = await resolveTabId({ tabId });
-  const tab = await chrome.tabs.update(tid, { url });
-  return { tabId: tid, url: tab.url || tab.pendingUrl };
+  const res = await navigateAndWait(tid, () => chrome.tabs.update(tid, { url }));
+  if (res.url && res.url.startsWith('chrome-error://')) throw new Error(`Navigation failed: could not load ${url}`);
+  return { tabId: tid, url: res.url || url, committed: res.committed };
+}
+
+/** Chrome words "no page to go to" as "next page" for BOTH directions; say what it means. */
+function historyError(err, direction) {
+  const msg = String(err?.message || err);
+  if (/Cannot find a (next|previous) page in history/i.test(msg)) {
+    return new Error(direction === 'back'
+      ? "No earlier page in this tab's history to go back to"
+      : "No later page in this tab's history to go forward to");
+  }
+  return err;
 }
 
 async function actionGoBack({ tabId }) {
   const tid = await resolveTabId({ tabId });
-  await chrome.tabs.goBack(tid);
-  return { tabId: tid, direction: 'back' };
+  let res;
+  try { res = await navigateAndWait(tid, () => chrome.tabs.goBack(tid)); } catch (e) { throw historyError(e, 'back'); }
+  return { tabId: tid, direction: 'back', url: res.url, committed: res.committed };
 }
 
 async function actionGoForward({ tabId }) {
   const tid = await resolveTabId({ tabId });
-  await chrome.tabs.goForward(tid);
-  return { tabId: tid, direction: 'forward' };
+  let res;
+  try { res = await navigateAndWait(tid, () => chrome.tabs.goForward(tid)); } catch (e) { throw historyError(e, 'forward'); }
+  return { tabId: tid, direction: 'forward', url: res.url, committed: res.committed };
 }
 
 // -- Screenshots & Window --
