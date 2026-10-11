@@ -121,12 +121,11 @@ async function announcePresence() {
 // Refresh capabilities each cycle in case permissions changed.
 // Stops itself when the extension runtime is invalidated.
 //
-// content.js matches <all_urls>, so this heartbeat would otherwise run on
-// every page the user visits, forever, keeping the MV3 service worker warm
-// globally even on tabs that will never host Clawser. Pause it while the
-// tab is hidden (backgrounded/minimized) — the common case for most open
-// tabs most of the time — and resume on visibility, rather than running
-// unconditionally.
+// content.js only runs on Clawser origins, so the heartbeat runs even while the
+// tab is hidden. That matters: a background tab opened by the scheduler is hidden
+// from birth, and Clawser boots slowly, so the one initial announcement below
+// fires before the page's ExtensionClient exists. Hidden tabs are throttled, which
+// only makes the heartbeat slower; the page can also ask for presence (below).
 let _presenceInterval = null;
 
 function startPresenceHeartbeat() {
@@ -150,15 +149,10 @@ function stopPresenceHeartbeat() {
 }
 
 announcePresence().then(() => console.log('[clawser-ext] Initial presence announced'));
-if (!document.hidden) startPresenceHeartbeat();
+startPresenceHeartbeat();
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    stopPresenceHeartbeat();
-  } else {
-    announcePresence();
-    startPresenceHeartbeat();
-  }
+  if (!document.hidden) announcePresence();
 });
 
 // ── Page → Background relay ──────────────────────────────────────
@@ -190,6 +184,18 @@ window.addEventListener('message', async (ev) => {
   // context from a page outside the intended localhost/127.0.0.1/file://
   // scope — see isAllowedOrigin() above.
   if (!isAllowedOrigin()) return;
+
+  // The page asks "is the extension there?" (its ExtensionClient is created long after
+  // this script loaded, so it may have missed the announcements). Answer every query at
+  // once; event-driven, so it works in a hidden, throttled tab. Our own 'present'
+  // announcements come back through this listener and are ignored.
+  if (msg.direction === 'presence') {
+    if (msg.action === 'query') {
+      _cachedCaps = await queryCapabilities();
+      if (_cachedCaps !== null) announcePresence();
+    }
+    return;
+  }
 
   // Answer to a btask request we pushed to the page (see below).
   if (msg.direction === 'btask_response') {

@@ -115,7 +115,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender?.tab?.id ?? null;
   const tabUrl = sender?.tab?.url ?? null;
 
-  handleAction(msg.action, msg.params || {})
+  handleAction(msg.action, msg.params || {}, sender)
     .then((result) => {
       recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: true, error: null });
       sendResponse({ result });
@@ -136,10 +136,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
  * @param {object} params
  * @returns {Promise<any>}
  */
-async function handleAction(action, params) {
+async function handleAction(action, params, sender) {
   switch (action) {
     // ── Status ──
     case 'status': return actionStatus(params);
+    case 'routine_failures': return actionRoutineFailures(params, sender);
     case 'capabilities': return actionCapabilities(params);
     case 'get_available_capabilities': return getAvailableCapabilities();
 
@@ -1513,7 +1514,8 @@ const MONITOR_EXEC_TIMEOUT_MS = 120000;
 function routineTimeoutMs(routine) {
   return (routine?.action?.type === 'btask_monitor' || routine?.actionType === 'btask_monitor') ? MONITOR_EXEC_TIMEOUT_MS : ROUTINE_EXEC_TIMEOUT_MS;
 }
-const TAB_OPEN_WAIT_MS = 20000;
+/** The page can take a while to connect (slow boot; the locked runner starts early but not instantly). */
+const TAB_OPEN_WAIT_MS = 60000;
 
 /** @type {{tabId: number, url: string, wsId: string|null, lastSeen: number}|null} */
 let lastKnownWorkspaceTab = null;
@@ -1731,7 +1733,7 @@ function handleNotify(msg, sender) {
     if (tabId !== undefined && tabUrl) {
       rememberWorkspace({ tabId, url: tabUrl, wsId: msg.wsId || null });
       const locked = msg.locked === true;
-      tabLockStates.set(tabId, { locked, capabilities: cleanCapabilities(msg.capabilities) });
+      tabLockStates.set(tabId, { locked, capabilities: cleanCapabilities(msg.capabilities), wsId: typeof msg.wsId === 'string' ? msg.wsId : null });
       if (!locked) setLockedSkip(false);
       const waiter = pendingReadyWaiters.get(tabId);
       if (waiter) { pendingReadyWaiters.delete(tabId); waiter(); }
@@ -1896,6 +1898,57 @@ function validateCronExpressionInline(expr) {
   return parts.every((p, i) => validateCronFieldRange(p, CRON_FIELD_RANGES[i][0], CRON_FIELD_RANGES[i][1]));
 }
 
+// ── Retry backoff and recent failures ─────────────────────────────
+
+const RETRY_BACKOFF_MS = [60000, 120000, 300000, 600000];
+const FAILURES_KEY = 'background_routine_failures';
+const FAILURES_MAX = 200;
+const FAILURES_REPLY_MAX = 50;
+
+/** Delay before retrying after the `failures`-th consecutive failure: 1, 2, 5, 10 min, then 10; never beyond the routine's own interval. */
+function retryDelayMs(failures, routine) {
+  let d = RETRY_BACKOFF_MS[Math.min(Math.max(failures, 1) - 1, RETRY_BACKOFF_MS.length - 1)];
+  const every = routine?.trigger?.type === 'interval' ? routine.trigger.intervalMs : routine?.meta?.scheduleType === 'interval' ? routine.meta.intervalMs : null;
+  if (Number.isFinite(every) && every > 0) d = Math.min(d, every);
+  return d;
+}
+
+/**
+ * Recent failed background attempts for the requesting tab's own workspace, so the page can show
+ * them on its next load. Allowed origins only, and only for the workspace that tab announced.
+ */
+async function actionRoutineFailures(params, sender) {
+  const tab = sender?.tab;
+  if (!tab || typeof tab.url !== 'string' || !isClawserUrl(tab.url, await getCustomOrigin())) throw new Error('Not allowed from this page');
+  const wsId = params?.wsId;
+  if (typeof wsId !== 'string' || wsId.length < 1 || wsId.length > 100) throw new Error('wsId is required');
+  if (tabLockStates.get(tab.id)?.wsId !== wsId) throw new Error('Unknown workspace for this tab');
+  const since = typeof params.since === 'number' && Number.isFinite(params.since) ? params.since : 0;
+
+  const db = await new Promise((resolve, reject) => {
+    const req = indexedDB.open('clawser_checkpoints', 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains('checkpoints')) req.result.createObjectStore('checkpoints');
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  try {
+    const all = await new Promise((resolve) => {
+      const r = db.transaction('checkpoints', 'readonly').objectStore('checkpoints').get(FAILURES_KEY);
+      r.onsuccess = () => resolve(Array.isArray(r.result) ? r.result : []);
+      r.onerror = () => resolve([]);
+    });
+    const mine = all
+      .filter((f) => f && f.wsId === wsId && Number.isFinite(f.at) && f.at > since)
+      .slice(-FAILURES_REPLY_MAX)
+      .map((f) => ({ at: f.at, routineId: clampText(String(f.routineId ?? ''), 100), error: clampText(String(f.error ?? ''), 300) }));
+    return { failures: mine };
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
+}
+
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== SCHEDULER_ALARM_NAME) return;
   if (schedulerBusy) return; // the previous alarm is still running its routines
@@ -1970,6 +2023,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       // (Untagged routines predate the sync and run as before.)
       if (r.wsId != null && r.wsId !== currentWsId) continue;
 
+      // A failed attempt waits for its backoff, then retries regardless of the schedule.
+      if (Number.isFinite(r.state?.retryAt) && r.state.retryAt > 0) {
+        if (now >= r.state.retryAt) due.push(r);
+        continue;
+      }
+
       if (r.trigger?.type === 'interval' && Number.isFinite(r.trigger.intervalMs)) {
         if (now >= (r.meta?.lastFired || 0) + r.trigger.intervalMs) due.push(r);
         continue;
@@ -2009,6 +2068,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       // The locked runner marks every reply locked:true; only its refusal ('locked') or our own
       // pre-check means "not run because locked". A real error keeps its message.
       const refused = !success && res.locked === true && (error === 'locked' || error === lockedResult().error);
+      const failed = !success && !refused; // a deliberate "locked" skip is not a failure
       const lastResult = success ? 'executed' : (refused ? 'not run: Clawser is locked' : `skipped: ${error}`);
       if (refused && !isMonitorRoutine(r)) await setLockedSkip(true);
       else if (success && !isMonitorRoutine(r)) await setLockedSkip(false);
@@ -2019,8 +2079,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         lastCronMinute: r.trigger?.type === 'cron' ? Math.floor(now / 60000) : null,
         interval: r.meta?.scheduleType === 'interval' || r.trigger?.type === 'interval',
         once: r.meta?.scheduleType === 'once' || r.trigger?.type === 'once',
+        failed,
+        error: failed ? clampText(String(error || 'failed'), 300) : null,
       });
-      results.push({ routineId: r.id, success, error });
+      const attempt = (r.state?.failures || 0) + 1;
+      results.push({ routineId: r.id, success, error, attempt, nextRetryAt: failed ? Date.now() + retryDelayMs(attempt, r) : null });
       if (!success) console.warn(`[clawser-ext] Routine "${r.name || r.id}" not executed: ${error}`);
     }
 
@@ -2032,6 +2095,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         const getRoutines = store.get(ROUTINE_KEY);
         getRoutines.onsuccess = () => {
           const current = Array.isArray(getRoutines.result) ? getRoutines.result : [];
+          const newFailures = [];
           for (const o of ran) {
             const cur = current.find((c) => c && c.id === o.id);
             if (!cur) continue; // deleted meanwhile: never bring it back
@@ -2039,11 +2103,29 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             cur.state.lastRun = o.lastRun;
             cur.state.lastResult = o.lastResult;
             cur.state.runCount = (cur.state.runCount || 0) + 1;
+            if (o.failed) {
+              // Do not advance the schedule: retry at the next due attempt, with backoff.
+              cur.state.failures = (cur.state.failures || 0) + 1;
+              cur.state.retryAt = o.lastRun + retryDelayMs(cur.state.failures, cur);
+              if (typeof cur.wsId === 'string') newFailures.push({ wsId: cur.wsId, routineId: cur.id, at: o.lastRun, error: o.error });
+              continue;
+            }
+            delete cur.state.failures;
+            delete cur.state.retryAt;
             if (o.lastCronMinute !== null) cur.state.lastCronMinute = o.lastCronMinute;
             if (cur.meta && o.interval) cur.meta.lastFired = now;
             if (cur.meta && o.once) cur.meta.fired = true;
           }
           store.put(current, ROUTINE_KEY);
+          if (newFailures.length) {
+            const getFail = store.get(FAILURES_KEY);
+            getFail.onsuccess = () => {
+              const list = Array.isArray(getFail.result) ? getFail.result : [];
+              list.push(...newFailures);
+              while (list.length > FAILURES_MAX) list.shift();
+              store.put(list, FAILURES_KEY);
+            };
+          }
           const getLog = store.get(LOG_KEY);
           getLog.onsuccess = () => {
             const log = Array.isArray(getLog.result) ? getLog.result : [];

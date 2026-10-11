@@ -122,7 +122,7 @@ describe('overlapping-alarm guard across the 120 s window', () => {
     await vt.advance(30000);
     await first;
     // next minute's alarm after the run ended
-    b.idbStore.get('background_routine_state')[0].state.lastCronMinute = 0;
+    { const st = b.idbStore.get('background_routine_state')[0].state; st.lastCronMinute = 0; delete st.retryAt; delete st.failures; }
     const next = b.fireAlarm();
     await vt.advance(1000);
     assert.equal(created.length, 2);
