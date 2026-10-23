@@ -209,3 +209,44 @@ describe('content.js — background → page relay (push)', () => {
     assert.deepEqual(popPosted(), []);
   });
 });
+
+describe('content.js — cancel relay (#35)', () => {
+  it('forwards a page cancel to the background as { direction: "cancel", id } and posts nothing itself', async (t) => {
+    const { postFromPage, popPosted, chrome } = await freshLoad(t);
+    const seen = [];
+    chrome.runtime.sendMessage = async (msg) => { seen.push(msg); };
+    postFromPage({ type: MARKER, direction: 'cancel', id: 'abc' });
+    await tick();
+    assert.deepEqual(seen.map((m) => ({ ...m })), [{ type: MARKER, direction: 'cancel', id: 'abc' }]);
+    assert.deepEqual(popPosted().filter((m) => m.direction === 'response'), []);
+  });
+
+  it('ignores a cancel with no id', async (t) => {
+    const { postFromPage, chrome } = await freshLoad(t);
+    let called = false;
+    chrome.runtime.sendMessage = async () => { called = true; };
+    postFromPage({ type: MARKER, direction: 'cancel' });
+    await tick();
+    assert.equal(called, false);
+  });
+
+  it('marks the response cancelled when the background replied cancelled', async (t) => {
+    const { postFromPage, popPosted, chrome } = await freshLoad(t);
+    chrome.runtime.sendMessage = async () => ({ error: 'Cancelled', cancelled: true });
+    postFromPage({ type: MARKER, direction: 'request', id: 7, action: 'wait', params: {} });
+    await tick();
+    const r = popPosted().find((m) => m.direction === 'response');
+    assert.equal(r.id, 7);
+    assert.equal(r.cancelled, true);
+    assert.equal(r.error, 'Cancelled');
+  });
+
+  it('a normal response carries no cancelled field', async (t) => {
+    const { postFromPage, popPosted, chrome } = await freshLoad(t);
+    chrome.runtime.sendMessage = async () => ({ result: 1 });
+    postFromPage({ type: MARKER, direction: 'request', id: 8, action: 'status', params: {} });
+    await tick();
+    const r = popPosted().find((m) => m.direction === 'response');
+    assert.equal('cancelled' in r, false);
+  });
+});

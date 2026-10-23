@@ -33,6 +33,12 @@ function recordAudit(entry) {
 const MAX_CONCURRENT_ACTIONS = 20;
 let inFlightCount = 0;
 
+/** RPC cancellation (#35): request id -> { tabId, cancel() } for every id'd request still in flight. */
+const inflightRequests = new Map();
+const CANCELLED_MESSAGE = 'Cancelled';
+const isRequestId = (id) => (typeof id === 'string' && id.length > 0 && id.length <= 200) || (typeof id === 'number' && Number.isFinite(id));
+function cancelledError() { const e = new Error(CANCELLED_MESSAGE); e.cancelled = true; return e; }
+
 // ── Init ──────────────────────────────────────────────────────────
 
 async function init() {
@@ -105,6 +111,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false; // fire-and-forget, no response expected
   }
 
+  // Cancel a request still in flight (#35). Fire-and-forget: no reply of its own;
+  // the cancelled request itself answers with { error, cancelled: true }. An unknown
+  // or finished id is a no-op, and only the tab that sent the request may cancel it.
+  if (msg.direction === 'cancel') {
+    const target = isRequestId(msg.id) ? inflightRequests.get(msg.id) : null;
+    if (target && target.tabId === (sender?.tab?.id ?? null)) target.cancel();
+    return false;
+  }
+
   if (inFlightCount >= MAX_CONCURRENT_ACTIONS) {
     console.warn(`[clawser-ext] Rejecting "${msg.action}" — ${inFlightCount} actions already in flight (limit ${MAX_CONCURRENT_ACTIONS})`);
     sendResponse({ error: `Too many concurrent requests (limit ${MAX_CONCURRENT_ACTIONS}) — try again shortly` });
@@ -116,17 +131,52 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender?.tab?.id ?? null;
   const tabUrl = sender?.tab?.url ?? null;
 
-  handleAction(msg.action, msg.params || {}, sender)
+  // One reply per request, and a slot released exactly once, whichever of
+  // "handler finished" / "page cancelled it" happens first.
+  let settled = false;
+  const entryId = msg.id;
+  let entry = null;
+  const settle = (reply) => {
+    if (settled) return false;
+    settled = true;
+    inFlightCount--;
+    if (entry) inflightRequests.delete(entryId);
+    sendResponse(reply);
+    return true;
+  };
+
+  // Cancellation (#35): only requests that carry an id can be cancelled.
+  const controller = new AbortController();
+  if (isRequestId(entryId) && !inflightRequests.has(entryId)) {
+    entry = {
+      tabId,
+      cancel() {
+        if (settled) return;
+        controller.abort();
+        recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: false, error: CANCELLED_MESSAGE });
+        settle({ error: CANCELLED_MESSAGE, cancelled: true });
+      },
+    };
+    inflightRequests.set(entryId, entry);
+  }
+
+  // Start on a microtask so a cancel that lands before the handler's first step skips it.
+  Promise.resolve()
+    .then(() => {
+      if (controller.signal.aborted) throw cancelledError();
+      return handleAction(msg.action, msg.params || {}, sender, controller.signal);
+    })
     .then((result) => {
+      if (settled) return; // cancelled meanwhile: never send a late success
       recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: true, error: null });
-      sendResponse({ result });
+      settle({ result });
     })
     .catch((err) => {
+      if (settled) return;
       const message = err.message || String(err);
       recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: false, error: message });
-      sendResponse({ error: message });
-    })
-    .finally(() => { inFlightCount--; });
+      settle(err && err.cancelled ? { error: CANCELLED_MESSAGE, cancelled: true } : { error: message });
+    });
 
   return true; // async sendResponse
 });
@@ -137,7 +187,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
  * @param {object} params
  * @returns {Promise<any>}
  */
-async function handleAction(action, params, sender) {
+async function handleAction(action, params, sender, signal) {
   switch (action) {
     // ── Status ──
     case 'status': return actionStatus(params);
@@ -153,9 +203,9 @@ async function handleAction(action, params, sender) {
     case 'tab_reload': return actionTabReload(params);
 
     // ── Navigation ──
-    case 'navigate': return actionNavigate(params);
-    case 'go_back': return actionGoBack(params);
-    case 'go_forward': return actionGoForward(params);
+    case 'navigate': return actionNavigate(params, signal);
+    case 'go_back': return actionGoBack(params, signal);
+    case 'go_forward': return actionGoForward(params, signal);
 
     // ── Screenshots & Window ──
     case 'screenshot': return actionScreenshot(params);
@@ -184,7 +234,7 @@ async function handleAction(action, params, sender) {
 
     // ── Execution ──
     case 'evaluate': return actionEvaluate(params);
-    case 'wait': return actionWait(params);
+    case 'wait': return actionWait(params, signal);
     case 'wait_cancel': return actionWaitCancel(params);
 
     // ── Monitoring ──
@@ -201,7 +251,7 @@ async function handleAction(action, params, sender) {
     case 'webmcp_call_tool': return actionWebmcpCallTool(params);
 
     // ── CORS-free fetch ──
-    case 'cors_fetch': return actionCorsFetch(params);
+    case 'cors_fetch': return actionCorsFetch(params, signal);
 
     // ── Tab Watch ──
     case 'tab_watch_start': return actionTabWatchStart(params);
@@ -301,6 +351,8 @@ function getAvailableCapabilities() {
   if (typeof chrome !== 'undefined' && chrome.cookies) caps.push('cookies');
   if (typeof chrome !== 'undefined' && chrome.webRequest) caps.push('network');
   caps.push('cors_fetch');
+  // RPC cancellation (#35): the extension understands a `cancel` message carrying a request id.
+  caps.push('cancel');
   // WebMCP tools exposed by other open tabs (document.modelContext), read and called on demand.
   if (typeof chrome !== 'undefined' && chrome.scripting && chrome.tabs) caps.push('webmcp_tabs');
   return caps;
@@ -331,6 +383,7 @@ function actionCapabilities() {
     { name: 'webmcp', available: true },
     { name: 'webmcp_tabs', available: !!(chrome.scripting && chrome.tabs), note: 'list and call document.modelContext tools of other open tabs, on demand' },
     { name: 'cors_fetch', available: true },
+    { name: 'cancel', available: true, note: 'cancel message aborts an in-flight request by id' },
   ];
   return { capabilities: caps, userScriptsAvailable };
 }
@@ -392,7 +445,7 @@ const pendingNavigations = new Map();
  * { committed, url } ; `url` is the committed URL (or null if it never committed in time).
  * Rejects if the trigger fails or the tab ends on Chrome's error page.
  */
-async function navigateAndWait(tid, trigger) {
+async function navigateAndWait(tid, trigger, signal) {
   const prior = pendingNavigations.get(tid);
   if (prior) await prior.catch(() => {});
 
@@ -405,9 +458,13 @@ async function navigateAndWait(tid, trigger) {
     };
     chrome.tabs.onUpdated.addListener(listener);
     const timer = setTimeout(() => finish(false), NAV_COMMIT_TIMEOUT_MS);
+    const onAbort = () => finish(false);
+    signal?.addEventListener('abort', onAbort, { once: true });
     try {
+      if (signal?.aborted) throw cancelledError();
       await trigger();
       const ok = await committed;
+      if (signal?.aborted) throw cancelledError();
       let url = null;
       if (ok) {
         try { const t = await chrome.tabs.get(tid); url = t.url || t.pendingUrl || null; } catch { /* tab gone */ }
@@ -415,6 +472,7 @@ async function navigateAndWait(tid, trigger) {
       return { committed: ok, url };
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       chrome.tabs.onUpdated.removeListener(listener);
     }
   })();
@@ -427,10 +485,10 @@ async function navigateAndWait(tid, trigger) {
  * forward work immediately afterwards. Pushes a normal history entry, like following a link.
  * Result: { tabId, url, committed }. committed:false means no commit within 10 s (url is the one asked for).
  */
-async function actionNavigate({ tabId, url }) {
+async function actionNavigate({ tabId, url }, signal) {
   if (!url) throw new Error('url is required');
   const tid = await resolveTabId({ tabId });
-  const res = await navigateAndWait(tid, () => chrome.tabs.update(tid, { url }));
+  const res = await navigateAndWait(tid, () => chrome.tabs.update(tid, { url }), signal);
   if (res.url && res.url.startsWith('chrome-error://')) throw new Error(`Navigation failed: could not load ${url}`);
   return { tabId: tid, url: res.url || url, committed: res.committed };
 }
@@ -446,17 +504,17 @@ function historyError(err, direction) {
   return err;
 }
 
-async function actionGoBack({ tabId }) {
+async function actionGoBack({ tabId }, signal) {
   const tid = await resolveTabId({ tabId });
   let res;
-  try { res = await navigateAndWait(tid, () => chrome.tabs.goBack(tid)); } catch (e) { throw historyError(e, 'back'); }
+  try { res = await navigateAndWait(tid, () => chrome.tabs.goBack(tid), signal); } catch (e) { throw historyError(e, 'back'); }
   return { tabId: tid, direction: 'back', url: res.url, committed: res.committed };
 }
 
-async function actionGoForward({ tabId }) {
+async function actionGoForward({ tabId }, signal) {
   const tid = await resolveTabId({ tabId });
   let res;
-  try { res = await navigateAndWait(tid, () => chrome.tabs.goForward(tid)); } catch (e) { throw historyError(e, 'forward'); }
+  try { res = await navigateAndWait(tid, () => chrome.tabs.goForward(tid), signal); } catch (e) { throw historyError(e, 'forward'); }
   return { tabId: tid, direction: 'forward', url: res.url, committed: res.committed };
 }
 
@@ -1078,10 +1136,15 @@ async function actionEvaluate({ tabId, script }) {
   }, [script]);
 }
 
-async function actionWait({ tabId, selector, timeout, condition }) {
+async function actionWait({ tabId, selector, timeout, condition }, signal) {
   if (!selector && !condition) throw new Error('selector or condition is required');
   const tid = await resolveTabId({ tabId });
   const ms = timeout || 10000;
+  if (signal?.aborted) throw cancelledError();
+  // On cancel, tell the page to stop polling (same flag as `wait_cancel`).
+  signal?.addEventListener('abort', () => {
+    executeInTab(tid, () => { window.__clawserWaitCancelled = true; }).catch(() => {});
+  }, { once: true });
 
   return executeInTab(tid, (sel, cond, timeoutMs) => {
     // Reset any stale cancellation flag from a previous wait on this page.
@@ -1227,7 +1290,7 @@ function isBlockedHost(hostname) {
 
 const CORS_FETCH_MAX_BODY = 2 * 1024 * 1024; // 2 MB
 
-async function actionCorsFetch({ url, method = 'GET', headers = {}, body }) {
+async function actionCorsFetch({ url, method = 'GET', headers = {}, body }, signal) {
   if (!url) throw new Error('url is required');
 
   let parsed;
@@ -1242,6 +1305,7 @@ async function actionCorsFetch({ url, method = 'GET', headers = {}, body }) {
   }
 
   const opts = { method, headers: headers || {}, redirect: 'follow' };
+  if (signal) opts.signal = signal;
   if (body && method !== 'GET') opts.body = body;
 
   const resp = await fetch(url, opts);

@@ -216,6 +216,14 @@ window.addEventListener('message', async (ev) => {
     return;
   }
 
+  // Cancel an in-flight request (#35). Relayed to the background, which answers the
+  // original request with { error, cancelled: true }; this message has no reply of its own.
+  if (msg.direction === 'cancel') {
+    if (msg.id === undefined || msg.id === null) return;
+    try { chrome.runtime.sendMessage({ type: MARKER, direction: 'cancel', id: msg.id }); } catch { /* runtime gone */ }
+    return;
+  }
+
   if (msg.direction !== 'request') return;
   if (msg.id === undefined || msg.id === null) {
     console.warn('[clawser-ext] Ignoring request with no id — the page won\'t be able to correlate a response:', msg.action);
@@ -233,13 +241,15 @@ window.addEventListener('message', async (ev) => {
       RELAY_TIMEOUT_MS,
     );
 
-    window.postMessage({
+    const reply = {
       type: MARKER,
       direction: 'response',
       id: msg.id,
       result: response?.result ?? null,
       error: response?.error ?? null,
-    }, '*');
+    };
+    if (response?.cancelled === true) reply.cancelled = true;
+    window.postMessage(reply, '*');
   } catch (err) {
     window.postMessage({
       type: MARKER,

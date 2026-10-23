@@ -197,6 +197,7 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
     TextEncoder,
     TextDecoder,
     AbortSignal,
+    AbortController,
   };
   vm.createContext(sandbox);
   vm.runInContext(BACKGROUND_SRC, sandbox, { filename: 'background.js' });
