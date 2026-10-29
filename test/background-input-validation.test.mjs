@@ -110,10 +110,10 @@ describe('actionSelectOption', () => {
 });
 
 describe('actionWait / actionWaitCancel', () => {
-  it('requires selector or condition', async () => {
+  it('requires selector or text', async () => {
     const { send } = loadBackground();
     const { error } = await send('wait', {});
-    assert.match(error, /selector or condition is required/);
+    assert.match(error, /selector or text is required/);
   });
 
   it('wait_cancel resolves even with nothing waiting', async () => {

@@ -18,6 +18,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BACKGROUND_SRC = readFileSync(path.join(__dirname, '..', 'background.js'), 'utf8');
 
 const MARKER = '__clawser_ext__';
+export const TEST_TOKEN = 'test-token-0123456789abcdef';
 
 function shallowMergeOneLevel(base, override) {
   const out = { ...base };
@@ -198,20 +199,47 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
     TextDecoder,
     AbortSignal,
     AbortController,
+    crypto: globalThis.crypto,
   };
   vm.createContext(sandbox);
   vm.runInContext(BACKGROUND_SRC, sandbox, { filename: 'background.js' });
 
+  // Pairing: unless a test opts out (opts.unpaired), the sender's origin is paired (all capabilities
+  // on) with TEST_TOKEN the first time it is used, so tests that are not about pairing stay about
+  // what they test. Pairing tests use sendRaw()/the UI helpers instead.
+  function ensurePaired(sender, caps = true) {
+    if (opts.unpaired) return;
+    // A real content-script sender always carries its URL; some older fixtures omit it.
+    if (sender && sender.tab && sender.tab.url === undefined && sender.url === undefined) sender.tab = { ...sender.tab, url: 'https://example.com' };
+    let origin; try { origin = new URL(sender?.url || sender?.tab?.url).origin; } catch { return; }
+    // opts.pairableOnly: pair only origins a person could really pair (built-in, custom, localhost), for origin tests.
+    if (opts.pairableOnly && !sandbox.normalizePairableOrigin(origin, localStore.clawserOrigin || null).ok) return;
+    const map = localStore.pairedOrigins || (localStore.pairedOrigins = {});
+    if (!map[origin]) {
+      map[origin] = { token: TEST_TOKEN, caps: { evaluate: caps, cookies: caps, cors_fetch: caps, inject_pod: caps }, pairedAt: 1 };
+    }
+  }
+
   /** Simulate a request/response RPC call, as content.js would relay it. */
   function send(action, params = {}, sender = { tab: { id: 1, url: 'https://example.com' } }) {
+    ensurePaired(sender);
     return new Promise((resolve) => {
-      hooks.listener({ type: MARKER, action, params }, sender, resolve);
+      hooks.listener({ type: MARKER, action, params, token: TEST_TOKEN }, sender, resolve);
+    });
+  }
+
+  /** Like send(), but exactly the message given: no auto-pairing, no token added. */
+  function sendRaw(message, sender = { tab: { id: 1, url: 'https://example.com' } }) {
+    return new Promise((resolve) => {
+      const r = hooks.listener({ type: MARKER, ...message }, sender, resolve);
+      if (r !== true) resolve(undefined);
     });
   }
 
   /** Simulate a fire-and-forget 'notify' message from a page. */
   function notify(action, extra = {}, sender = { tab: { id: 1, url: 'https://example.com' } }) {
-    hooks.listener({ type: MARKER, direction: 'notify', action, ...extra }, sender, () => {});
+    ensurePaired(sender);
+    hooks.listener({ type: MARKER, direction: 'notify', action, token: TEST_TOKEN, ...extra }, sender, () => {});
   }
 
   /**
@@ -220,7 +248,8 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
    * for routines to reach the extension.
    */
   function pageSync(routines, { wsId = 'ws1', url = 'https://clawser.erisera.com/#workspace/ws1', tabId = 5, tabUrl = url } = {}) {
-    hooks.listener({ type: MARKER, direction: 'notify', action: 'routines_sync', wsId, url, routines }, { tab: { id: tabId, url: tabUrl } }, () => {});
+    ensurePaired({ tab: { id: tabId, url: tabUrl } });
+    hooks.listener({ type: MARKER, direction: 'notify', action: 'routines_sync', wsId, url, routines, token: TEST_TOKEN }, { tab: { id: tabId, url: tabUrl } }, () => {});
     return new Promise((r) => setTimeout(r, 15));
   }
 
@@ -246,5 +275,5 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   /** Simulate a context-menu click. */
   function clickMenu(info, tab) { return hooks.menuListener?.(info, tab); }
 
-  return { sandbox, send, sendUi, install, clickMenu, tabUpdated, notify, fireAlarm, chrome: chromeStub, idbStore, pageIdb, pageSync, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
+  return { sandbox, send, sendRaw, ensurePaired, sendUi, install, clickMenu, tabUpdated, notify, fireAlarm, chrome: chromeStub, idbStore, pageIdb, pageSync, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
 }

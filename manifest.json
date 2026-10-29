@@ -45,7 +45,6 @@
         "https://localhost/*",
         "http://127.0.0.1/*",
         "https://127.0.0.1/*",
-        "file:///*",
         "https://clawser.erisera.com/*"
       ],
       "js": ["content.js"],
@@ -61,7 +60,6 @@
         "https://localhost/*",
         "http://127.0.0.1/*",
         "https://127.0.0.1/*",
-        "file:///*",
         "https://clawser.erisera.com/*"
       ]
     }

@@ -78,14 +78,12 @@ describe('audit log', () => {
     assert.match(failedEntry.error, /Unknown action/);
   });
 
-  it('clears the log when clear:true is passed', async () => {
+  it('a page cannot clear the log: clear:true is ignored (see pairing-hardening for the UI clear)', async () => {
     const { send } = loadBackground();
     await send('status', {});
-    const first = await send('audit_log', { clear: true });
-    assert.ok(first.result.entries.length > 0);
+    await send('audit_log', { clear: true });
     const second = await send('audit_log', {});
-    // Only the "audit_log(clear:true)" and "audit_log()" calls themselves remain.
-    assert.equal(second.result.entries.length, 1);
+    assert.ok(second.result.entries.length >= 2);
   });
 
   it('records a pod_message notification relayed from pod-inject.js\'s extensionBridge', async () => {

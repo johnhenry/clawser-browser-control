@@ -12,7 +12,7 @@ const chromeManifest = JSON.parse(read('manifest.json'));
 const firefoxManifest = JSON.parse(read('firefox/manifest.json'));
 
 const MATCHES = [
-  'http://localhost/*', 'https://localhost/*', 'http://127.0.0.1/*', 'https://127.0.0.1/*', 'file:///*',
+  'http://localhost/*', 'https://localhost/*', 'http://127.0.0.1/*', 'https://127.0.0.1/*', 
   'https://clawser.erisera.com/*',
 ];
 

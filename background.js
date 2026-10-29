@@ -22,6 +22,8 @@ const NETWORK_BUFFER_MAX = 200;
 const auditLog = [];
 const AUDIT_LOG_MAX = 500;
 
+// Append-only: the only operations are recordAudit() (push) and the extension-UI
+// clear (clearAuditLog). No page-reachable action can remove entries.
 function recordAudit(entry) {
   auditLog.push(entry);
   if (auditLog.length > AUDIT_LOG_MAX) auditLog.splice(0, auditLog.length - AUDIT_LOG_MAX);
@@ -106,24 +108,50 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (!msg || msg.type !== MARKER) return false;
 
-  if (msg.direction === 'notify') {
-    handleNotify(msg, sender);
+  // Pairing handshake: the content script of a page asks "am I paired, and with which token?".
+  // Answered only to a content script (sender.tab), for the sender's own origin.
+  if (msg.direction === 'hello') {
+    helloForSender(sender).then(sendResponse, () => sendResponse({ paired: false }));
+    return true;
+  }
+
+  // Every other page message is authorized HERE, in the background: the sender's own origin
+  // (taken from the browser, never from the message) must be paired, and the message must carry
+  // that origin's token. The content script's own check is only defense in depth.
+  if (msg.direction === 'notify' || msg.direction === 'cancel') {
+    authorizeSender(msg, sender).then((auth) => {
+      if (!auth.ok) { recordDenied(msg, sender, auth.code); return; }
+      if (msg.direction === 'notify') handleNotify(msg, sender);
+      else {
+        const target = isRequestId(msg.id) ? inflightRequests.get(msg.id) : null;
+        if (target && target.tabId === (sender?.tab?.id ?? null)) target.cancel();
+      }
+    });
     return false; // fire-and-forget, no response expected
   }
 
-  // Cancel a request still in flight (#35). Fire-and-forget: no reply of its own;
-  // the cancelled request itself answers with { error, cancelled: true }. An unknown
-  // or finished id is a no-op, and only the tab that sent the request may cancel it.
-  if (msg.direction === 'cancel') {
-    const target = isRequestId(msg.id) ? inflightRequests.get(msg.id) : null;
-    if (target && target.tabId === (sender?.tab?.id ?? null)) target.cancel();
-    return false;
-  }
+  authorizeSender(msg, sender).then((auth) => {
+    if (!auth.ok) {
+      recordDenied(msg, sender, auth.code);
+      sendResponse({ error: auth.message, code: auth.code });
+      return;
+    }
+    const gate = capabilityGate(msg.action, auth.record);
+    if (gate) {
+      recordDenied(msg, sender, 'capability_disabled');
+      sendResponse({ error: gate, code: 'capability_disabled' });
+      return;
+    }
+    runRequest(msg, sender, sendResponse, auth);
+  }, () => sendResponse({ error: 'Pairing check failed', code: 'not_paired' }));
+  return true; // async sendResponse
+});
 
+function runRequest(msg, sender, sendResponse, auth) {
   if (inFlightCount >= MAX_CONCURRENT_ACTIONS) {
     console.warn(`[clawser-ext] Rejecting "${msg.action}" — ${inFlightCount} actions already in flight (limit ${MAX_CONCURRENT_ACTIONS})`);
     sendResponse({ error: `Too many concurrent requests (limit ${MAX_CONCURRENT_ACTIONS}) — try again shortly` });
-    return true;
+    return;
   }
 
   inFlightCount++;
@@ -164,7 +192,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   Promise.resolve()
     .then(() => {
       if (controller.signal.aborted) throw cancelledError();
-      return handleAction(msg.action, msg.params || {}, sender, controller.signal);
+      return handleAction(msg.action, msg.params || {}, sender, controller.signal, auth);
     })
     .then((result) => {
       if (settled) return; // cancelled meanwhile: never send a late success
@@ -177,9 +205,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: false, error: message });
       settle(err && err.cancelled ? { error: CANCELLED_MESSAGE, cancelled: true } : { error: message });
     });
-
-  return true; // async sendResponse
-});
+}
 
 /**
  * Route an action to the appropriate handler.
@@ -187,13 +213,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
  * @param {object} params
  * @returns {Promise<any>}
  */
-async function handleAction(action, params, sender, signal) {
+async function handleAction(action, params, sender, signal, auth) {
   switch (action) {
     // ── Status ──
-    case 'status': return actionStatus(params);
+    case 'status': return actionStatus(auth && auth.record);
     case 'routine_failures': return actionRoutineFailures(params, sender);
-    case 'capabilities': return actionCapabilities(params);
-    case 'get_available_capabilities': return getAvailableCapabilities();
+    case 'capabilities': return actionCapabilities(auth && auth.record);
+    case 'get_available_capabilities': return getAvailableCapabilities(auth && auth.record);
 
     // ── Tabs ──
     case 'tabs_list': return actionTabsList(params);
@@ -240,7 +266,7 @@ async function handleAction(action, params, sender, signal) {
     // ── Monitoring ──
     case 'console': return actionConsole(params);
     case 'network': return actionNetwork(params);
-    case 'audit_log': return actionAuditLog(params);
+    case 'audit_log': return actionAuditLog();
 
     // ── Cookies ──
     case 'cookies': return actionCookies(params);
@@ -344,13 +370,16 @@ function assertHasTarget({ selector, text, x, y }) {
  * Return coarse capability names based on which Chrome APIs are available.
  * Used by content.js to announce real capabilities to the page.
  */
-function getAvailableCapabilities() {
+function getAvailableCapabilities(record) {
   const caps = [];
+  if (!record) return caps; // unpaired: announce nothing
   if (typeof chrome !== 'undefined' && chrome.tabs) caps.push('tabs');
   if (typeof chrome !== 'undefined' && chrome.scripting) caps.push('scripting');
-  if (typeof chrome !== 'undefined' && chrome.cookies) caps.push('cookies');
+  if (typeof chrome !== 'undefined' && chrome.cookies && record.caps.cookies) caps.push('cookies');
   if (typeof chrome !== 'undefined' && chrome.webRequest) caps.push('network');
-  caps.push('cors_fetch');
+  if (record.caps.cors_fetch) caps.push('cors_fetch');
+  if (record.caps.evaluate) caps.push('evaluate');
+  if (record.caps.inject_pod) caps.push('inject_pod');
   // RPC cancellation (#35): the extension understands a `cancel` message carrying a request id.
   caps.push('cancel');
   // WebMCP tools exposed by other open tabs (document.modelContext), read and called on demand.
@@ -358,31 +387,32 @@ function getAvailableCapabilities() {
   return caps;
 }
 
-async function actionStatus() {
+async function actionStatus(record) {
   return {
     connected: true,
     version: VERSION,
     userScriptsAvailable,
-    availableCapabilities: getAvailableCapabilities(),
-    capabilities: actionCapabilities().capabilities,
+    availableCapabilities: getAvailableCapabilities(record),
+    capabilities: actionCapabilities(record).capabilities,
   };
 }
 
-function actionCapabilities() {
+function actionCapabilities(record) {
+  const granted = (c) => !!(record && record.caps && record.caps[c]);
   const caps = [
     { name: 'tabs', available: true },
     { name: 'navigate', available: true },
     { name: 'screenshot', available: true },
     { name: 'resize', available: true },
-    { name: 'cookies', available: !!chrome.cookies },
+    { name: 'cookies', available: !!chrome.cookies && granted('cookies'), note: granted('cookies') ? undefined : 'off for this page; a person enables it in the extension options' },
     { name: 'network', available: !!chrome.webRequest },
     { name: 'dom', available: true, note: userScriptsAvailable ? 'userScripts (MAIN world)' : 'scripting (ISOLATED world, reduced)' },
     { name: 'input', available: true, note: userScriptsAvailable ? 'userScripts events' : 'scripting (limited)' },
-    { name: 'evaluate', available: true },
+    { name: 'evaluate', available: granted('evaluate'), note: granted('evaluate') ? undefined : 'off for this page; a person enables it in the extension options' },
     { name: 'console', available: true },
     { name: 'webmcp', available: true },
     { name: 'webmcp_tabs', available: !!(chrome.scripting && chrome.tabs), note: 'list and call document.modelContext tools of other open tabs, on demand' },
-    { name: 'cors_fetch', available: true },
+    { name: 'cors_fetch', available: granted('cors_fetch'), note: granted('cors_fetch') ? undefined : 'off for this page; a person enables it in the extension options' },
     { name: 'cancel', available: true, note: 'cancel message aborts an in-flight request by id' },
   ];
   return { capabilities: caps, userScriptsAvailable };
@@ -575,6 +605,16 @@ async function actionReadPage({ tabId, maxDepth }) {
 
     let refCounter = 0;
     const refMap = {};
+    // REDACTION: keep in sync with the copies in get_html and tab_watch_start (a test compares them).
+    const isSensitiveField = (el) => {
+      if (!el || !el.tagName) return false;
+      const tag = el.tagName;
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return false;
+      const attr = (n) => String(el.getAttribute(n) || '').toLowerCase();
+      if (attr('type') === 'password') return true;
+      if (/(^|\s)(cc-[a-z-]+|one-time-code|current-password|new-password)(\s|$)/.test(attr('autocomplete'))) return true;
+      return /card.?(number|num|no)|cc.?(num|number|exp|csc|cvc|cvv)|cvc|cvv|security.?code|one.?time|otp|totp|2fa|mfa.?code|verification.?code/.test(attr('name') + ' ' + attr('id') + ' ' + attr('inputmode'));
+    };
 
     function getRole(el) {
       const explicit = el.getAttribute('role');
@@ -619,7 +659,7 @@ async function actionReadPage({ tabId, maxDepth }) {
       const name = getName(node);
       if (name) entry.name = name;
 
-      if (node.value !== undefined && node.value !== '') entry.value = String(node.value).slice(0, 200);
+      if (node.value !== undefined && node.value !== '') entry.value = isSensitiveField(node) ? '[redacted]' : String(node.value).slice(0, 200);
       if (node.disabled) entry.disabled = true;
       if (node.checked) entry.checked = true;
       if (node.tagName === 'A' && node.href) entry.href = node.href;
@@ -716,20 +756,36 @@ async function actionGetText({ tabId, maxChars }) {
 async function actionGetHtml({ tabId, selector, ref, strip, maxChars }) {
   const tid = await resolveTabId({ tabId });
   return executeInTab(tid, (sel, doStrip, max) => {
+    // REDACTION: keep in sync with the copies in get_html and tab_watch_start (a test compares them).
+    const isSensitiveField = (el) => {
+      if (!el || !el.tagName) return false;
+      const tag = el.tagName;
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return false;
+      const attr = (n) => String(el.getAttribute(n) || '').toLowerCase();
+      if (attr('type') === 'password') return true;
+      if (/(^|\s)(cc-[a-z-]+|one-time-code|current-password|new-password)(\s|$)/.test(attr('autocomplete'))) return true;
+      return /card.?(number|num|no)|cc.?(num|number|exp|csc|cvc|cvv)|cvc|cvv|security.?code|one.?time|otp|totp|2fa|mfa.?code|verification.?code/.test(attr('name') + ' ' + attr('id') + ' ' + attr('inputmode'));
+    };
     const el = sel ? document.querySelector(sel) : document.documentElement;
     if (!el) return { error: `Element not found: ${sel}` };
-    let html;
+    // Always serialize a clone so sensitive values can be blanked without touching the page.
+    const clone = el.cloneNode(true);
+    const blank = (f) => {
+      f.removeAttribute('value');
+      f.setAttribute('value', '[redacted]');
+      if (f.tagName === 'TEXTAREA') f.textContent = '[redacted]';
+      if (f.tagName === 'SELECT') for (const o of Array.from(f.querySelectorAll('option'))) o.removeAttribute('selected');
+    };
+    if (isSensitiveField(clone)) blank(clone);
+    for (const f of Array.from(clone.querySelectorAll('input, textarea, select'))) if (isSensitiveField(f)) blank(f);
     if (doStrip) {
-      const clone = el.cloneNode(true);
       for (const n of Array.from(clone.querySelectorAll('script, style, noscript, template, svg, iframe, link, meta'))) n.remove();
       const walker = document.createTreeWalker(clone, 128 /* NodeFilter.SHOW_COMMENT */);
       const comments = [];
       for (let c = walker.nextNode(); c; c = walker.nextNode()) comments.push(c);
       for (const c of comments) c.remove();
-      html = clone.outerHTML;
-    } else {
-      html = el.outerHTML;
     }
+    const html = clone.outerHTML;
     return { html: html.slice(0, max), truncated: html.length > max, length: html.length };
   }, [selector || ref || 'html', strip === true, clampMaxChars(maxChars)]);
 }
@@ -1136,8 +1192,15 @@ async function actionEvaluate({ tabId, script }) {
   }, [script]);
 }
 
-async function actionWait({ tabId, selector, timeout, condition }, signal) {
-  if (!selector && !condition) throw new Error('selector or condition is required');
+// `wait` supports a CSS selector or visible text only. It never evaluates page-supplied code:
+// the former `condition` expression was an eval path that bypassed `evaluate`'s capability gate.
+async function actionWait({ tabId, selector, text, timeout, condition }, signal) {
+  if (condition !== undefined && condition !== null && condition !== '') {
+    throw new Error('wait no longer accepts a "condition" expression; use "selector" or "text"');
+  }
+  if (!selector && !text) throw new Error('selector or text is required');
+  if (selector !== undefined && selector !== null && typeof selector !== 'string') throw new Error('selector must be a string');
+  if (text !== undefined && text !== null && typeof text !== 'string') throw new Error('text must be a string');
   const tid = await resolveTabId({ tabId });
   const ms = timeout || 10000;
   if (signal?.aborted) throw cancelledError();
@@ -1146,7 +1209,7 @@ async function actionWait({ tabId, selector, timeout, condition }, signal) {
     executeInTab(tid, () => { window.__clawserWaitCancelled = true; }).catch(() => {});
   }, { once: true });
 
-  return executeInTab(tid, (sel, cond, timeoutMs) => {
+  return executeInTab(tid, (sel, wantText, timeoutMs) => {
     // Reset any stale cancellation flag from a previous wait on this page.
     window.__clawserWaitCancelled = false;
 
@@ -1163,15 +1226,9 @@ async function actionWait({ tabId, selector, timeout, condition }, signal) {
           const el = document.querySelector(sel);
           if (el) return resolve({ found: true, elapsed: Date.now() - start });
         }
-        if (cond) {
-          try {
-            if ((0, eval)(cond)) return resolve({ found: true, elapsed: Date.now() - start });
-          } catch (e) {
-            // A condition that throws will never succeed — surface the
-            // error immediately instead of silently retrying every
-            // interval until the overall timeout expires.
-            return resolve({ found: false, error: `condition threw: ${e.message}`, elapsed: Date.now() - start });
-          }
+        if (wantText) {
+          const body = document.body;
+          if (body && (body.innerText || '').includes(wantText)) return resolve({ found: true, elapsed: Date.now() - start });
         }
         if (Date.now() - start > timeoutMs) {
           return resolve({ found: false, timeout: true, elapsed: Date.now() - start });
@@ -1181,7 +1238,7 @@ async function actionWait({ tabId, selector, timeout, condition }, signal) {
       }
       check();
     });
-  }, [selector, condition, ms]);
+  }, [selector || null, text || null, ms]);
 }
 
 /** Cancel an in-progress `wait` action on the given tab, if any. */
@@ -1248,13 +1305,18 @@ async function actionNetwork({ tabId, urlPattern, clear }) {
 }
 
 /**
- * Read (and optionally clear) the audit log of actions this extension has
- * executed, including which tab/page requested each one.
+ * Read the audit log of actions this extension has executed, including which
+ * tab/page requested each one. Read-only from a page: the log can only be
+ * cleared from the extension's own UI (see clearAuditLog / handleUiMessage).
  */
-async function actionAuditLog({ clear } = {}) {
-  const entries = [...auditLog];
-  if (clear) auditLog.length = 0;
-  return { entries };
+async function actionAuditLog() {
+  return { entries: [...auditLog] };
+}
+
+function clearAuditLog() {
+  const n = auditLog.length;
+  auditLog.length = 0;
+  return n;
 }
 
 // -- Cookies --
@@ -1591,11 +1653,30 @@ async function actionTabWatchStart({ tabId, selector, siteProfile }) {
       }
     }
 
+    // REDACTION: keep in sync with the copies in read_page and get_html (a test compares them).
+    const isSensitiveField = (el) => {
+      if (!el || !el.tagName) return false;
+      const tag = el.tagName;
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return false;
+      const attr = (n) => String(el.getAttribute(n) || '').toLowerCase();
+      if (attr('type') === 'password') return true;
+      if (/(^|\s)(cc-[a-z-]+|one-time-code|current-password|new-password)(\s|$)/.test(attr('autocomplete'))) return true;
+      return /card.?(number|num|no)|cc.?(num|number|exp|csc|cvc|cvv)|cvc|cvv|security.?code|one.?time|otp|totp|2fa|mfa.?code|verification.?code/.test(attr('name') + ' ' + attr('id') + ' ' + attr('inputmode'));
+    };
+    const redactedText = (node) => {
+      if (isSensitiveField(node)) return '[redacted]';
+      const clone = node.cloneNode(true);
+      for (const f of Array.from(clone.querySelectorAll('input, textarea, select'))) {
+        if (isSensitiveField(f)) f.textContent = '[redacted]';
+      }
+      return clone.textContent?.trim() || '';
+    };
+
     function extractMessage(node) {
       if (window.__clawserWatchSeen.has(node)) return null;
       window.__clawserWatchSeen.add(node);
 
-      const text = node.textContent?.trim() || '';
+      const text = redactedText(node);
       let sender = 'unknown';
 
       if (senderSel) {
@@ -1818,7 +1899,7 @@ function rememberWorkspace({ tabId, url, wsId }) {
 }
 
 async function persistWorkspaceRef(ref) {
-  if (!isClawserUrl(ref.url, await getCustomOrigin())) return;
+  if (!isClawserUrl(ref.url, await getTrustedOrigins())) return;
   await chrome.storage.local.set({ [WORKSPACE_REF_KEY]: ref });
 }
 
@@ -1830,7 +1911,7 @@ async function loadWorkspaceRef() {
     const { wsId, url, lastSeen } = stored;
     if (wsId !== null && !isWorkspaceId(wsId)) return;
     if (typeof url !== 'string' || url.length > BTASK_MAX_URL) return;
-    if (!isClawserUrl(url, await getCustomOrigin())) return; // origin no longer allowed: do not open it
+    if (!isClawserUrl(url, await getTrustedOrigins())) return; // origin no longer allowed: do not open it
     if (!lastKnownWorkspaceTab) {
       lastKnownWorkspaceTab = { tabId: -1, url, wsId, lastSeen: Number.isFinite(lastSeen) ? lastSeen : 0 };
     }
@@ -1916,7 +1997,7 @@ async function handleRoutinesSync(msg, sender) {
   const tabId = sender?.tab?.id;
   const tabUrl = sender?.tab?.url;
   if (tabId === undefined || typeof tabUrl !== 'string') return;
-  if (!isClawserUrl(tabUrl, await getCustomOrigin())) return;
+  if (!isClawserUrl(tabUrl, await getTrustedOrigins())) return;
   const wsId = msg.wsId;
   if (!isWorkspaceId(wsId)) return;
   if (!Array.isArray(msg.routines)) return;
@@ -2323,7 +2404,7 @@ async function recoverOrphanedAttempts(db) {
   const orphans = attempts.filter((a) => a && typeof a.routineId === 'string' && !activeAttempts.has(attemptKey(a)));
   if (orphans.length === 0) return;
 
-  const custom = await getCustomOrigin();
+  const custom = await getTrustedOrigins();
   for (const a of orphans) {
     if (!Number.isInteger(a.tabId)) continue;
     try {
@@ -2366,7 +2447,7 @@ function retryDelayMs(failures, routine) {
  */
 async function actionRoutineFailures(params, sender) {
   const tab = sender?.tab;
-  if (!tab || typeof tab.url !== 'string' || !isClawserUrl(tab.url, await getCustomOrigin())) throw new Error('Not allowed from this page');
+  if (!tab || typeof tab.url !== 'string' || !isClawserUrl(tab.url, await getTrustedOrigins())) throw new Error('Not allowed from this page');
   const wsId = params?.wsId;
   if (!isWorkspaceId(wsId)) throw new Error('wsId is required');
   if (tabLockStates.get(tab.id)?.wsId !== wsId) throw new Error('Unknown workspace for this tab');
@@ -2757,14 +2838,17 @@ function normalizeClawserOrigin(input) {
   return { ok: true, origin: u.origin };
 }
 
-/** Is this tab URL a Clawser page (built-in origins, or the configured custom origin)? */
-function isClawserUrl(url, customOrigin) {
+/**
+ * Is this tab URL a paired Clawser page? Exact origin match (scheme, host and port) against the
+ * built-in default origin plus `trusted` (an array of origins, or a single origin). Nothing else
+ * matches: not other ports of localhost, not file: pages.
+ */
+function isClawserUrl(url, trusted) {
   let u;
   try { u = new URL(url); } catch { return false; }
-  if (u.protocol === 'file:') return true;
-  if ((u.protocol === 'http:' || u.protocol === 'https:') && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) return true;
-  if (u.protocol === 'https:') return u.origin === DEFAULT_CLAWSER_ORIGIN || (!!customOrigin && u.origin === customOrigin);
-  return false;
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+  const list = Array.isArray(trusted) ? trusted : (trusted ? [trusted] : []);
+  return u.origin === DEFAULT_CLAWSER_ORIGIN || list.includes(u.origin);
 }
 
 /** The validated custom origin from storage, or null. A corrupt value counts as unset. */
@@ -2805,7 +2889,7 @@ async function applyOriginRegistration(origin) {
 
 async function injectIntoOpenClawserTabs() {
   try {
-    const custom = await getCustomOrigin();
+    const custom = await getTrustedOrigins();
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
       if (!tab.url || !isClawserUrl(tab.url, custom)) continue;
@@ -2826,6 +2910,8 @@ async function setClawserOrigin(input) {
   }
   const origin = checked ? checked.origin : null;
   await runOriginJob(async () => {
+    const previous = await getCustomOrigin();
+    if (previous && previous !== origin) await unpairOrigin(previous); // a removed/replaced custom origin loses its pairing
     if (origin) await chrome.storage.local.set({ [CUSTOM_ORIGIN_KEY]: origin });
     else await chrome.storage.local.remove(CUSTOM_ORIGIN_KEY);
     await applyOriginRegistration(origin);
@@ -2909,6 +2995,251 @@ function isOwnExtensionPage(sender) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---- Pairing, tokens and per-origin capabilities ----
+//
+// A page may use this extension only if its exact origin (scheme, host AND port) is paired.
+// - Pre-listed: the built-in clawser origin and the one custom https origin set on the options page
+//   (both are set by a person). Their record, with a fresh token, is created on first use.
+// - Anything else (a localhost dev server, say) is added ONLY from the extension's own UI
+//   (options page), by a person. A page can cause its origin to show up in the "waiting" list;
+//   it can never approve itself.
+// Each paired origin has a random token. The content script fetches it from this background
+// (the page never sees it) and attaches it to every message; authorizeSender() checks the sender's
+// origin (taken from the browser) and the token on every request, notify and cancel.
+// Risky capabilities are per origin and off by default; a person turns them on in the options page.
+
+const PAIRED_KEY = 'pairedOrigins';
+const PENDING_KEY = 'pairingPending'; // chrome.storage.session
+const PENDING_MAX = 10;
+/** Actions gated behind a per-origin capability, and the capability each needs. */
+const ACTION_CAPABILITY = { evaluate: 'evaluate', cookies: 'cookies', cors_fetch: 'cors_fetch', inject_pod: 'inject_pod' };
+const CAPABILITY_NAMES = ['evaluate', 'cookies', 'cors_fetch', 'inject_pod'];
+const NOT_PAIRED_MESSAGE = 'This page is not paired with the Clawser Browser Control extension. Open the extension\'s options page and pair this origin.';
+
+function defaultCaps() { return Object.fromEntries(CAPABILITY_NAMES.map((c) => [c, false])); }
+
+function newToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function tokensEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length || a.length === 0) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** The sender's origin as the browser reports it (never from message contents). Top frame only. */
+function senderOrigin(sender) {
+  try {
+    if (!sender || !sender.tab) return null;
+    if (sender.frameId !== undefined && sender.frameId !== 0) return null;
+    return new URL(sender.url || sender.tab.url).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate an origin a person wants to pair: an exact http(s) origin on localhost or 127.0.0.1 (any
+ * port, but each one is paired individually), the built-in clawser origin, or the custom origin.
+ * No paths, wildcards or credentials. file: pages cannot be paired.
+ */
+function normalizePairableOrigin(input, customOrigin = null) {
+  const fail = (error) => ({ ok: false, error });
+  if (typeof input !== 'string') return fail('Enter an origin such as http://localhost:5173');
+  const raw = input.trim();
+  if (!raw || raw.length > 200) return fail('Enter an origin such as http://localhost:5173');
+  if (/[\s*<>"'\\^`{|}?#]/.test(raw)) return fail('Use a plain origin: no spaces, wildcards, path, query or fragment');
+  let u;
+  try { u = new URL(raw); } catch { return fail('That is not a valid URL'); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return fail('Only http and https origins can be paired');
+  if (u.username || u.password) return fail('The origin must not contain a username or password');
+  if (u.pathname !== '/') return fail('Use only the origin, without a path');
+  const local = u.hostname === 'localhost' || u.hostname === '127.0.0.1';
+  if (!local && u.origin !== DEFAULT_CLAWSER_ORIGIN && u.origin !== customOrigin) {
+    return fail('Only localhost, 127.0.0.1, the built-in Clawser origin and the custom origin can be paired');
+  }
+  return { ok: true, origin: u.origin };
+}
+
+let pairingChain = Promise.resolve();
+function runPairingJob(fn) {
+  const run = pairingChain.then(fn, fn);
+  pairingChain = run.catch(() => {});
+  return run;
+}
+
+async function readPairings() {
+  try {
+    const stored = await chrome.storage.local.get(PAIRED_KEY);
+    const raw = stored && stored[PAIRED_KEY];
+    const out = {};
+    if (raw && typeof raw === 'object') {
+      for (const [origin, rec] of Object.entries(raw)) {
+        if (!rec || typeof rec.token !== 'string' || rec.token.length < 16) continue;
+        const caps = defaultCaps();
+        for (const c of CAPABILITY_NAMES) caps[c] = rec.caps?.[c] === true;
+        out[origin] = { token: rec.token, caps, pairedAt: Number(rec.pairedAt) || 0 };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+async function writePairings(map) { await chrome.storage.local.set({ [PAIRED_KEY]: map }); }
+
+/** The pairing record for `origin`, creating it for a pre-listed origin (built-in / custom). */
+async function getPairing(origin) {
+  if (!origin) return null;
+  const map = await readPairings();
+  if (map[origin]) return map[origin];
+  if (origin !== DEFAULT_CLAWSER_ORIGIN && origin !== await getCustomOrigin()) return null;
+  return runPairingJob(async () => {
+    const fresh = await readPairings();
+    if (!fresh[origin]) {
+      fresh[origin] = { token: newToken(), caps: defaultCaps(), pairedAt: Date.now() };
+      await writePairings(fresh);
+    }
+    return fresh[origin];
+  });
+}
+
+/** Every origin that is currently trusted (custom + paired). The built-in origin is always implied. */
+async function getTrustedOrigins() {
+  const out = new Set(Object.keys(await readPairings()));
+  const custom = await getCustomOrigin();
+  if (custom) out.add(custom);
+  return [...out];
+}
+
+async function addPendingOrigin(origin) {
+  if (!origin || !/^https?:/.test(origin)) return;
+  try {
+    const got = await chrome.storage.session.get(PENDING_KEY);
+    const list = Array.isArray(got?.[PENDING_KEY]) ? got[PENDING_KEY] : [];
+    if (list.includes(origin)) return;
+    list.push(origin);
+    await chrome.storage.session.set({ [PENDING_KEY]: list.slice(-PENDING_MAX) });
+  } catch { /* session storage unavailable: the person can still type the origin in */ }
+}
+
+async function getPendingOrigins() {
+  try {
+    const got = await chrome.storage.session.get(PENDING_KEY);
+    return Array.isArray(got?.[PENDING_KEY]) ? got[PENDING_KEY].filter((o) => typeof o === 'string') : [];
+  } catch { return []; }
+}
+
+/** Content script handshake: paired? what token? which capabilities? */
+async function helloForSender(sender) {
+  const origin = senderOrigin(sender);
+  const rec = await getPairing(origin);
+  if (!rec) {
+    await addPendingOrigin(origin);
+    return { paired: false, capabilities: [] };
+  }
+  return { paired: true, token: rec.token, capabilities: getAvailableCapabilities(rec) };
+}
+
+/**
+ * Authorize one page message in the background. Returns { ok: true, origin, record } or
+ * { ok: false, code, message }. Checks the sender's origin and the origin's token.
+ */
+async function authorizeSender(msg, sender) {
+  const origin = senderOrigin(sender);
+  const rec = await getPairing(origin);
+  if (!rec) {
+    await addPendingOrigin(origin);
+    return { ok: false, code: 'not_paired', message: NOT_PAIRED_MESSAGE };
+  }
+  if (!tokensEqual(msg && msg.token, rec.token)) {
+    return { ok: false, code: 'bad_token', message: 'Pairing token missing or stale; reload the page.' };
+  }
+  return { ok: true, origin, record: rec };
+}
+
+/** Message explaining why a gated action is refused, or null if allowed. */
+function capabilityGate(action, record) {
+  const cap = Object.prototype.hasOwnProperty.call(ACTION_CAPABILITY, action) ? ACTION_CAPABILITY[action] : null;
+  if (!cap) return null;
+  if (record && record.caps[cap] === true) return null;
+  return `The "${cap}" capability is off for this page. A person can turn it on in the extension's options page.`;
+}
+
+function recordDenied(msg, sender, code) {
+  recordAudit({
+    timestamp: Date.now(),
+    action: String(msg && (msg.action || msg.direction)).slice(0, 60),
+    tabId: sender?.tab?.id ?? null,
+    url: sender?.tab?.url ?? null,
+    success: false,
+    error: code,
+  });
+}
+
+// Operations below are reachable only from the extension's own pages (handleUiMessage).
+
+async function pairOrigin(input) {
+  const checked = normalizePairableOrigin(input, await getCustomOrigin());
+  if (!checked.ok) return checked;
+  await runPairingJob(async () => {
+    const map = await readPairings();
+    if (!map[checked.origin]) {
+      map[checked.origin] = { token: newToken(), caps: defaultCaps(), pairedAt: Date.now() };
+      await writePairings(map);
+    }
+  });
+  try {
+    const got = await chrome.storage.session.get(PENDING_KEY);
+    const list = (Array.isArray(got?.[PENDING_KEY]) ? got[PENDING_KEY] : []).filter((o) => o !== checked.origin);
+    await chrome.storage.session.set({ [PENDING_KEY]: list });
+  } catch { /* ignore */ }
+  return { ok: true, origin: checked.origin };
+}
+
+async function unpairOrigin(origin) {
+  await runPairingJob(async () => {
+    const map = await readPairings();
+    delete map[origin];
+    await writePairings(map);
+  });
+  return { ok: true };
+}
+
+async function setOriginCapability(origin, cap, enabled) {
+  if (!CAPABILITY_NAMES.includes(cap)) return { ok: false, error: 'Unknown capability' };
+  if (typeof enabled !== 'boolean') return { ok: false, error: 'enabled must be true or false' };
+  const map = await readPairings();
+  if (!map[origin] && (origin === DEFAULT_CLAWSER_ORIGIN || origin === await getCustomOrigin())) await getPairing(origin);
+  return runPairingJob(async () => {
+    const fresh = await readPairings();
+    if (!fresh[origin]) return { ok: false, error: 'That origin is not paired' };
+    fresh[origin].caps[cap] = enabled;
+    await writePairings(fresh);
+    return { ok: true };
+  });
+}
+
+async function pairingOverview() {
+  const custom = await getCustomOrigin();
+  await getPairing(DEFAULT_CLAWSER_ORIGIN);
+  if (custom) await getPairing(custom);
+  const map = await readPairings();
+  const origins = Object.entries(map).map(([origin, rec]) => ({
+    origin,
+    builtin: origin === DEFAULT_CLAWSER_ORIGIN,
+    custom: origin === custom,
+    caps: rec.caps,
+    pairedAt: rec.pairedAt,
+  }));
+  return { origins, pending: (await getPendingOrigins()).filter((o) => !map[o]), capabilities: CAPABILITY_NAMES };
+}
+
 // ---- UI message router ----
 
 async function handleUiMessage(msg, sender) {
@@ -2918,6 +3249,18 @@ async function handleUiMessage(msg, sender) {
       return { origin: await getCustomOrigin(), defaultOrigin: DEFAULT_CLAWSER_ORIGIN };
     case 'set_clawser_origin':
       return setClawserOrigin(msg.origin);
+    case 'pairing_overview':
+      return pairingOverview();
+    case 'pairing_add':
+      return pairOrigin(msg.origin);
+    case 'pairing_remove':
+      return unpairOrigin(msg.origin);
+    case 'pairing_set_capability':
+      return setOriginCapability(msg.origin, msg.capability, msg.enabled);
+    case 'audit_get':
+      return { entries: [...auditLog] };
+    case 'audit_clear':
+      return { ok: true, cleared: clearAuditLog() };
     case 'btask_list':
       return btaskFetch('clawser.btask.list', 'definitions', normalizeDefinitions);
     case 'btask_inbox':
@@ -2982,7 +3325,7 @@ async function askClawserTab(tabId, request) {
 }
 
 async function findClawserTabs() {
-  const custom = await getCustomOrigin();
+  const custom = await getTrustedOrigins();
   const tabs = await chrome.tabs.query({});
   return tabs
     .filter((t) => typeof t.url === 'string' && isClawserUrl(t.url, custom) && !schedulerOwnedTabs.has(t.id))

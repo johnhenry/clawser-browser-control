@@ -25,11 +25,17 @@ describe('normalizeClawserOrigin', () => {
 
 describe('isClawserUrl', () => {
   const { sandbox } = loadBackground();
-  const yes = ['http://localhost:5173/x', 'https://localhost/', 'http://127.0.0.1:8080/', 'file:///a/b.html', 'https://clawser.erisera.com/'];
-  const no = ['https://evil.localhost.attacker.com/', 'https://localhost.attacker.com/', 'http://clawser.erisera.com/',
+  const yes = ['https://clawser.erisera.com/', 'https://clawser.erisera.com/a/b?c=1'];
+  const no = ['http://localhost:5173/x', 'https://localhost/', 'http://127.0.0.1:8080/', 'file:///a/b.html', 'https://evil.localhost.attacker.com/', 'https://localhost.attacker.com/', 'http://clawser.erisera.com/',
     'https://clawser.erisera.com.evil.com/', 'https://example.com/', 'chrome://extensions', 'not a url', '', null];
   for (const u of yes) it(`true for ${u}`, () => assert.equal(sandbox.isClawserUrl(u, null), true));
   for (const u of no) it(`false for ${u}`, () => assert.equal(sandbox.isClawserUrl(u, null), false));
+  it('honours paired origins exactly (scheme, host and port)', () => {
+    const paired = ['http://localhost:5173'];
+    assert.equal(sandbox.isClawserUrl('http://localhost:5173/x', paired), true);
+    assert.equal(sandbox.isClawserUrl('http://localhost:5174/x', paired), false);
+    assert.equal(sandbox.isClawserUrl('https://localhost:5173/x', paired), false);
+  });
   it('honours the custom origin exactly', () => {
     assert.equal(sandbox.isClawserUrl('https://c.example.com/app', 'https://c.example.com'), true);
     assert.equal(sandbox.isClawserUrl('https://c.example.com:444/app', 'https://c.example.com'), false);
