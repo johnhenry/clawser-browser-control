@@ -19,6 +19,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONTENT_SRC = readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 
 const MARKER = '__clawser_ext__';
+export const CONTENT_TEST_TOKEN = 'content-test-token';
 
 /**
  * @param {object} [chromeOverrides] - overrides for chrome.runtime
@@ -73,10 +74,15 @@ export function loadContent(chromeOverrides = {}, opts = {}) {
   const defaultRuntime = {
     id: 'fake-extension-id',
     getManifest: () => ({ version: '9.8.7' }),
-    sendMessage: async () => ({}),
+    // The pairing handshake is answered here (paired with CONTENT_TEST_TOKEN) unless a test passes
+    // opts.paired === false. Tests that replace sendMessage later keep the state from load time.
+    sendMessage: async (m) => (m && m.direction === 'hello'
+      ? (opts.paired === false ? { paired: false, capabilities: [] } : { paired: true, token: CONTENT_TEST_TOKEN, capabilities: [] })
+      : {}),
     onMessage: { addListener: (fn) => runtimeListeners.push(fn) },
   };
-  const chromeStub = { runtime: { ...defaultRuntime, ...(chromeOverrides.runtime || chromeOverrides) } };
+  const overrides = chromeOverrides.runtime || chromeOverrides;
+  const chromeStub = { runtime: { ...defaultRuntime, ...overrides } };
   if (opts.storage) {
     chromeStub.storage = { local: { get: async (k) => { const o = {}; for (const key of [].concat(k)) if (key in opts.storage) o[key] = opts.storage[key]; return o; } } };
   }

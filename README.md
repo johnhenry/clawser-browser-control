@@ -48,9 +48,17 @@ Beyond the permissions used for browser control (`tabs`, `activeTab`, `scripting
 
 Neither grants access to page content by itself. Nothing is read from a page except when you choose a context-menu entry or send a draft, and a draft is only a message to your Clawser tab: Clawser shows it and nothing runs until you confirm there.
 
-### Clawser origin
+### Pairing, tokens and capabilities
 
-The content script (the bridge between Clawser and the extension) runs only on `http(s)://localhost`, `http(s)://127.0.0.1`, `file://` and `https://clawser.erisera.com`. If you host Clawser elsewhere, set one additional **https origin** on the extension's options page. It must be a plain origin (no path, wildcard, credentials or IP address). The service worker validates it, stores it in `chrome.storage.local`, and registers `content.js` for exactly that origin; `content.js` re-checks `location.origin` itself before relaying anything. Only extension pages (the options page and the side panel) can change it; a web page cannot.
+The content script (the bridge between Clawser and the extension) is injected on `http(s)://localhost`, `http(s)://127.0.0.1`, `https://clawser.erisera.com` and the one optional custom https origin, but it relays nothing until that page's **exact origin** (scheme, host and port) is paired:
+
+- `https://clawser.erisera.com` and the custom origin (set on the options page) are pre-listed.
+- Any other origin, such as a localhost dev server on a specific port, is paired only by a person in the extension's **options page** ("Paired pages"). A page can make its origin appear in the "waiting" list; it cannot approve itself. `file:` pages cannot be paired.
+- Each paired origin has a random token that the content script gets from the service worker and attaches to every message; the page never sees it. The service worker checks the sender's origin and the token on every request, notification and cancel.
+- `evaluate`, `cookies`, `cors_fetch` and `inject_pod` are off for every origin until a person turns them on in the options page. Presence announcements list only what is enabled.
+- `wait` takes a `selector` or `text`; it never evaluates code.
+- `read_page`, `get_html` and watch buffers redact password fields, `autocomplete` `cc-*` / `one-time-code` fields and fields whose name or id marks them as card, CVC or one-time-code inputs.
+- The audit log is append-only. A page can read it (`audit_log`) but cannot clear it; it is cleared from the options page.
 
 ## Development
 

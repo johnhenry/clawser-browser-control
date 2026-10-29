@@ -1,6 +1,6 @@
 // content.js — Clawser Extension content script
-// Injected into Clawser pages (localhost / 127.0.0.1 / file:/// / https://clawser.erisera.com,
-// plus one optional user-configured https origin).
+// Injected into Clawser pages (localhost / 127.0.0.1 / https://clawser.erisera.com,
+// plus one optional user-configured https origin). It relays only for a PAIRED origin.
 // Relays messages between the Clawser web app (postMessage) and the
 // extension background service worker (chrome.runtime).
 
@@ -59,44 +59,37 @@ function normalizeClawserOrigin(input) {
   return { ok: true, origin: u.origin };
 }
 
-let customOrigin = null;
-const originsReady = (async () => {
-  try {
-    const stored = await chrome.storage.local.get('clawserOrigin');
-    const r = normalizeClawserOrigin(stored && stored.clawserOrigin);
-    customOrigin = r.ok ? r.origin : null;
-  } catch {
-    customOrigin = null; // no storage access: only the built-in origins apply
-  }
-})();
+// Pairing state. The background is the authority (it checks the sender's origin and token on every
+// message); this is the content script's copy. `token` is secret: it is fetched from the background
+// and attached to messages here, and is never posted to the page.
+let pairState = { paired: false, token: null, capabilities: [] };
+let originsReady = Promise.resolve();
 
-function isAllowedOrigin() {
+/** Ask the background whether this page's origin is paired. Never throws. */
+async function refreshPairing() {
+  if (!isRuntimeAlive()) { pairState = { paired: false, token: null, capabilities: null }; return pairState; }
   try {
-    const { protocol, hostname } = location;
-    if (protocol === 'file:') return true;
-    if (hostname === 'localhost' || hostname === '127.0.0.1') return true;
-    if (protocol !== 'https:') return false;
-    const origin = location.origin;
-    return origin === DEFAULT_CLAWSER_ORIGIN || (customOrigin !== null && origin === customOrigin);
+    const resp = await chrome.runtime.sendMessage({ type: MARKER, direction: 'hello' });
+    pairState = resp && resp.paired === true && typeof resp.token === 'string'
+      ? { paired: true, token: resp.token, capabilities: Array.isArray(resp.capabilities) ? resp.capabilities : [] }
+      : { paired: false, token: null, capabilities: [] };
   } catch {
-    return false;
+    pairState = { paired: false, token: null, capabilities: null }; // runtime gone
   }
+  return pairState;
+}
+originsReady = refreshPairing();
+
+/** Defense in depth only; the background re-checks origin and token on every message. */
+function isAllowedOrigin() {
+  return pairState.paired === true && typeof pairState.token === 'string';
 }
 
-/** Query the background for which Chrome APIs are actually available. */
+/** Refresh pairing and return the capabilities granted to this page (null = extension gone). */
 async function queryCapabilities() {
   if (!isRuntimeAlive()) return null; // signal: extension gone
-  try {
-    const resp = await chrome.runtime.sendMessage({
-      type: MARKER,
-      action: 'get_available_capabilities',
-      params: {},
-    });
-    return resp?.result || [];
-  } catch {
-    // sendMessage failed — runtime likely invalidated
-    return null;
-  }
+  const st = await refreshPairing();
+  return st.capabilities; // [] while unpaired; null if the runtime died
 }
 
 /** Cached capabilities — refreshed each announce cycle. */
@@ -114,6 +107,7 @@ async function announcePresence() {
     action: 'present',
     version: VERSION,
     capabilities: _cachedCaps,
+    paired: pairState.paired === true,
   }, '*');
   return true;
 }
@@ -180,11 +174,9 @@ window.addEventListener('message', async (ev) => {
   // The custom origin loads asynchronously; hold the message until it has,
   // so a legitimate custom-origin page is not dropped and nothing else gets in.
   await originsReady;
-
-  // Reject relaying anything into the extension's privileged background
-  // context from a page outside the intended localhost/127.0.0.1/file://
-  // scope — see isAllowedOrigin() above.
-  if (!isAllowedOrigin()) return;
+  // Pairing can change at any time (a person pairs this origin in the options page): recheck
+  // when we believe we are unpaired.
+  if (!isAllowedOrigin() && msg.direction !== 'presence') await refreshPairing();
 
   // The page asks "is the extension there?" (its ExtensionClient is created long after
   // this script loaded, so it may have missed the announcements). Answer every query at
@@ -208,8 +200,9 @@ window.addEventListener('message', async (ev) => {
   // ready" or "here's the result of a routine you asked me to run") — no
   // response expected, so no id correlation needed.
   if (msg.direction === 'notify') {
+    if (!isAllowedOrigin()) return;
     try {
-      chrome.runtime.sendMessage(msg);
+      chrome.runtime.sendMessage({ ...msg, token: pairState.token });
     } catch {
       // Runtime likely invalidated — nothing to relay to.
     }
@@ -220,7 +213,8 @@ window.addEventListener('message', async (ev) => {
   // original request with { error, cancelled: true }; this message has no reply of its own.
   if (msg.direction === 'cancel') {
     if (msg.id === undefined || msg.id === null) return;
-    try { chrome.runtime.sendMessage({ type: MARKER, direction: 'cancel', id: msg.id }); } catch { /* runtime gone */ }
+    if (!isAllowedOrigin()) return;
+    try { chrome.runtime.sendMessage({ type: MARKER, direction: 'cancel', id: msg.id, token: pairState.token }); } catch { /* runtime gone */ }
     return;
   }
 
@@ -231,15 +225,21 @@ window.addEventListener('message', async (ev) => {
   }
 
   try {
-    const response = await withTimeout(
+    const send = () => withTimeout(
       chrome.runtime.sendMessage({
         type: MARKER,
         id: msg.id,
         action: msg.action,
         params: msg.params,
+        token: pairState.token,
       }),
       RELAY_TIMEOUT_MS,
     );
+    // Unpaired: still ask, so the background answers "not_paired" and lists this origin for a
+    // person to approve. A stale token (re-paired origin) is refreshed once.
+    let response = await send();
+    if (response && response.code === 'bad_token') { await refreshPairing(); response = await send(); }
+    else if (response && response.code === 'not_paired') pairState = { paired: false, token: null, capabilities: [] };
 
     const reply = {
       type: MARKER,
@@ -283,6 +283,7 @@ function settleBtask(msg) {
 
 async function handleBtaskRequest(msg, sendResponse) {
   await originsReady;
+  if (!isAllowedOrigin()) await refreshPairing();
   if (!isAllowedOrigin()) { sendResponse({ transportError: 'origin_not_allowed' }); return; }
   const request = msg.request;
   if (!request || typeof request !== 'object' || !BTASK_TYPES.includes(request.type)) {

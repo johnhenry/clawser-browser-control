@@ -948,7 +948,7 @@ class InjectedPod extends Pod {
 // script runs as a MAIN-world content script, so it has no chrome.* API
 // access of its own and must go through content.js regardless.
 //
-// content.js enforces its own localhost/127.0.0.1/file:// origin allowlist
+// content.js enforces its own paired-origin check
 // before relaying anything to background.js (defense in depth alongside the
 // manifest's content_scripts/web_accessible_resources match patterns), so
 // this bridge does no origin filtering itself — content.js is the trust

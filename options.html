@@ -13,8 +13,8 @@
     <form id="origin-form" novalidate>
       <h2 id="origin-h">Clawser web app origin</h2>
       <p class="hint" id="origin-help">
-        The extension connects to Clawser on <code>localhost</code>, <code>127.0.0.1</code>, local files, and
-        <code>https://clawser.erisera.com</code> by default. If you host Clawser somewhere else, enter its
+        The extension connects to Clawser on <code>https://clawser.erisera.com</code> by default (pair a localhost
+        dev server below). If you host Clawser somewhere else, enter its
         https origin here (for example <code>https://clawser.example.com</code>), with no path. Only this one
         extra origin is allowed.
       </p>
@@ -29,6 +29,36 @@
         <button type="button" id="btn-reset">Use default only</button>
       </div>
     </form>
+
+    <section aria-labelledby="pair-h">
+      <h2 id="pair-h">Paired pages</h2>
+      <p class="hint">
+        Only pages listed here can use this extension, matched by exact origin (scheme, host and port).
+        Risky capabilities are off until you turn them on for a page.
+      </p>
+      <div id="paired-list"></div>
+      <h3 id="pending-h">Waiting to be paired</h3>
+      <p class="hint">Pages that asked to connect. Nothing happens until you pair one.</p>
+      <div id="pending-list"></div>
+      <form id="pair-form" novalidate>
+        <p>
+          <label for="pair-origin">Pair an origin (for example <code>http://localhost:5173</code>)</label><br>
+          <input id="pair-origin" type="text" inputmode="url" autocomplete="off" spellcheck="false" size="40">
+        </p>
+        <p id="pair-error" class="status" role="alert"></p>
+        <div class="row"><button type="submit" id="btn-pair">Pair</button></div>
+      </form>
+    </section>
+
+    <section aria-labelledby="audit-h">
+      <h2 id="audit-h">Audit log</h2>
+      <p class="hint">Actions pages asked for, newest last. Pages can read this log but cannot clear it.</p>
+      <pre id="audit-view" tabindex="0"></pre>
+      <div class="row">
+        <button type="button" id="btn-audit-refresh">Refresh</button>
+        <button type="button" id="btn-audit-clear">Clear audit log</button>
+      </div>
+    </section>
 
     <p id="status" class="status" role="status" aria-live="polite"></p>
   </main>

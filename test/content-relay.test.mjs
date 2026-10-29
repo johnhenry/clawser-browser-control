@@ -1,7 +1,7 @@
 // Run with: node --test test/content-relay.test.mjs
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadContent } from './_load-content.mjs';
+import { loadContent, CONTENT_TEST_TOKEN } from './_load-content.mjs';
 
 const MARKER = '__clawser_ext__';
 
@@ -132,60 +132,63 @@ describe('content.js — page → background relay', () => {
   });
 });
 
-describe('content.js — origin allowlist (defense in depth)', () => {
-  const ALLOWED_LOCATIONS = [
-    { href: 'http://localhost:5173/workspace', protocol: 'http:', hostname: 'localhost' },
-    { href: 'https://localhost/workspace', protocol: 'https:', hostname: 'localhost' },
-    { href: 'http://127.0.0.1:8080/workspace', protocol: 'http:', hostname: '127.0.0.1' },
-    { href: 'https://127.0.0.1/workspace', protocol: 'https:', hostname: '127.0.0.1' },
-    { href: 'file:///Users/x/clawser/index.html', protocol: 'file:', hostname: '' },
-    { href: 'https://clawser.erisera.com/', protocol: 'https:', hostname: 'clawser.erisera.com', origin: 'https://clawser.erisera.com' },
-  ];
+describe('content.js — pairing (defense in depth; the background re-checks)', () => {
+  it('relays requests with the origin token, and never posts the token to the page', async (t) => {
+    const { postFromPage, popPosted, chrome } = await freshLoad(t);
+    const seen = [];
+    chrome.runtime.sendMessage = async (m) => { seen.push(m); return { result: 1 }; };
+    postFromPage({ type: MARKER, direction: 'request', id: 1, action: 'ping' });
+    await tick();
+    assert.equal(seen[0].token, CONTENT_TEST_TOKEN);
+    const posted = popPosted();
+    assert.ok(!JSON.stringify(posted).includes(CONTENT_TEST_TOKEN));
+    assert.equal(posted.find((m) => m.direction === 'response').result, 1);
+  });
 
-  const BLOCKED_LOCATIONS = [
-    { href: 'https://example.com/workspace', protocol: 'https:', hostname: 'example.com' },
-    { href: 'https://evil.localhost.attacker.com/', protocol: 'https:', hostname: 'evil.localhost.attacker.com' },
-    { href: 'https://localhost.attacker.com/', protocol: 'https:', hostname: 'localhost.attacker.com' },
-  ];
+  it('ignores a token the page tries to supply', async (t) => {
+    const { postFromPage, chrome } = await freshLoad(t);
+    const seen = [];
+    chrome.runtime.sendMessage = async (m) => { seen.push(m); return { result: 1 }; };
+    postFromPage({ type: MARKER, direction: 'request', id: 1, action: 'ping', token: 'page-chosen' });
+    await tick();
+    assert.equal(seen[0].token, CONTENT_TEST_TOKEN);
+  });
 
-  for (const location of ALLOWED_LOCATIONS) {
-    it(`relays requests from an allowed origin (${location.href})`, async (t) => {
-      const { postFromPage, popPosted, chrome } = await freshLoad(t, {}, { location });
-      chrome.runtime.sendMessage = async () => ({ result: 1 });
+  it('unpaired: sends no token, relays no notifications, and passes the not_paired error back', async (t) => {
+    const { postFromPage, popPosted, chrome } = await freshLoad(t, {}, { paired: false });
+    const seen = [];
+    chrome.runtime.sendMessage = async (m) => { seen.push(m); return m.direction === 'hello' ? { paired: false } : { error: 'not paired', code: 'not_paired' }; };
+    postFromPage({ type: MARKER, direction: 'notify', action: 'workspace_ready', wsId: 'ws1' });
+    postFromPage({ type: MARKER, direction: 'request', id: 2, action: 'ping' });
+    await tick();
+    assert.ok(!seen.some((m) => m.direction === 'notify'));
+    const req = seen.find((m) => m.action === 'ping');
+    assert.equal(req.token, null);
+    assert.equal(popPosted().find((m) => m.direction === 'response').error, 'not paired');
+  });
 
-      postFromPage({ type: MARKER, direction: 'request', id: 1, action: 'ping' });
-      await tick();
+  it('presence reports paired:false and no capabilities while unpaired', async (t) => {
+    const ctx = loadContent({}, { paired: false });
+    t.after(() => ctx.stop());
+    await tick(5);
+    const p = ctx.popPosted().find((m) => m.direction === 'presence');
+    assert.equal(p.paired, false);
+    assert.deepEqual(JSON.parse(JSON.stringify(p.capabilities)), []);
+  });
 
-      const [response] = popPosted().filter((m) => m.direction === 'response');
-      assert.equal(response.id, 1);
-      assert.deepEqual(response.result, 1);
-    });
-  }
-
-  for (const location of BLOCKED_LOCATIONS) {
-    it(`does not relay requests from a disallowed origin (${location.href})`, async (t) => {
-      const { postFromPage, popPosted, chrome } = await freshLoad(t, {}, { location });
-      let called = false;
-      chrome.runtime.sendMessage = async () => { called = true; return { result: 1 }; };
-
-      postFromPage({ type: MARKER, direction: 'request', id: 2, action: 'ping' });
-      await tick();
-
-      assert.equal(called, false);
-      assert.deepEqual(popPosted().filter((m) => m.direction === 'response'), []);
-    });
-
-    it(`does not relay notifications from a disallowed origin (${location.href})`, async (t) => {
-      const { postFromPage, chrome } = await freshLoad(t, {}, { location });
-      let called = false;
-      chrome.runtime.sendMessage = async () => { called = true; return {}; };
-
-      postFromPage({ type: MARKER, direction: 'notify', action: 'workspace_ready', wsId: 'ws1' });
-      await tick();
-
-      assert.equal(called, false);
-    });
-  }
+  it('refreshes a stale token once and retries', async (t) => {
+    const { postFromPage, popPosted, chrome } = await freshLoad(t);
+    const tokens = [];
+    chrome.runtime.sendMessage = async (m) => {
+      if (m.direction === 'hello') return { paired: true, token: 'fresh', capabilities: [] };
+      tokens.push(m.token);
+      return m.token === 'fresh' ? { result: 'ok' } : { error: 'stale', code: 'bad_token' };
+    };
+    postFromPage({ type: MARKER, direction: 'request', id: 3, action: 'ping' });
+    await tick(10);
+    assert.deepEqual(tokens, [CONTENT_TEST_TOKEN, 'fresh']);
+    assert.equal(popPosted().find((m) => m.direction === 'response').result, 'ok');
+  });
 });
 
 describe('content.js — background → page relay (push)', () => {
@@ -217,7 +220,7 @@ describe('content.js — cancel relay (#35)', () => {
     chrome.runtime.sendMessage = async (msg) => { seen.push(msg); };
     postFromPage({ type: MARKER, direction: 'cancel', id: 'abc' });
     await tick();
-    assert.deepEqual(seen.map((m) => ({ ...m })), [{ type: MARKER, direction: 'cancel', id: 'abc' }]);
+    assert.deepEqual(seen.map((m) => ({ ...m })), [{ type: MARKER, direction: 'cancel', id: 'abc', token: CONTENT_TEST_TOKEN }]);
     assert.deepEqual(popPosted().filter((m) => m.direction === 'response'), []);
   });
 
