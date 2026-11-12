@@ -151,19 +151,19 @@ describe('routines_sync', () => {
 });
 
 describe('routines_sync validation and origin', () => {
-  const synced = async (routines, opts) => { const b = loadBackground(); await b.pageSync(routines, opts); return stored(b); };
+  const synced = async (routines, opts) => { const b = loadBackground({}, { pairableOnly: true }); await b.pageSync(routines, opts); return stored(b); };
 
   it('accepts only senders on an allowed origin', async () => {
-    for (const tabUrl of ['https://evil.example/', 'http://clawser.erisera.com/', 'https://clawser.erisera.com.evil.com/', 'chrome://x']) {
+    for (const tabUrl of ['https://evil.example/', 'http://clawser.erisera.com/', 'https://clawser.erisera.com.evil.com/', 'chrome://x', 'file:///a/index.html']) {
       assert.deepEqual(await synced([cron('a')], { tabUrl }), [], tabUrl);
     }
-    for (const tabUrl of ['http://localhost:5173/', 'http://127.0.0.1:8080/', 'https://clawser.erisera.com/x', 'file:///a/index.html']) {
+    for (const tabUrl of ['http://localhost:5173/', 'http://127.0.0.1:8080/', 'https://clawser.erisera.com/x']) {
       assert.equal((await synced([cron('a')], { tabUrl })).length, 1, tabUrl);
     }
   });
 
   it('accepts the configured custom origin and nothing else on that host', async () => {
-    const mk = () => loadBackground({}, { storage: { clawserOrigin: 'https://c.example.com' } });
+    const mk = () => loadBackground({}, { storage: { clawserOrigin: 'https://c.example.com' }, pairableOnly: true });
     let b = mk(); await b.pageSync([cron('a')], { tabUrl: 'https://c.example.com/app' }); assert.equal(stored(b).length, 1);
     b = mk(); await b.pageSync([cron('a')], { tabUrl: 'https://c.example.com:444/app' }); assert.equal(stored(b).length, 0);
   });
@@ -237,7 +237,7 @@ describe('workspace reference survives a service-worker restart', () => {
   });
 
   it('does not persist a reference from a disallowed origin', async () => {
-    const b = loadBackground();
+    const b = loadBackground({}, { pairableOnly: true });
     await b.pageSync([cron('a')], { tabUrl: 'https://evil.example/' });
     assert.equal(b.localStore.workspaceRef, undefined);
   });

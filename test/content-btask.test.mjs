@@ -27,36 +27,6 @@ describe('content.js origin allowlist with production + custom origin', () => {
     assert.equal(popPosted().filter((m) => m.direction === 'response')[0].result, 1);
   });
 
-  it('still blocks look-alikes and http://clawser.erisera.com', async (t) => {
-    for (const href of ['http://clawser.erisera.com/', 'https://clawser.erisera.com.evil.com/', 'https://evilclawser.erisera.com/', 'https://erisera.com/']) {
-      const { postFromPage, popPosted, chrome } = await freshLoad(t, {}, { location: loc(href) });
-      let called = false;
-      chrome.runtime.sendMessage = async () => { called = true; return { result: 1 }; };
-      postFromPage({ type: MARKER, direction: 'request', id: 1, action: 'ping' });
-      await tick(5);
-      assert.equal(called, false, href);
-      assert.deepEqual(popPosted().filter((m) => m.direction === 'response'), []);
-    }
-  });
-
-  it('allows the configured custom origin (read from storage) and nothing else on that host', async (t) => {
-    const storage = { clawserOrigin: 'https://c.example.com' };
-    const ok = await freshLoad(t, {}, { location: loc('https://c.example.com/x'), storage });
-    ok.chrome.runtime.sendMessage = async () => ({ result: 7 });
-    ok.postFromPage({ type: MARKER, direction: 'request', id: 1, action: 'ping' });
-    await tick(5);
-    assert.equal(ok.popPosted().filter((m) => m.direction === 'response')[0].result, 7);
-
-    for (const href of ['https://c.example.com:444/', 'https://sub.c.example.com/', 'http://c.example.com/']) {
-      const bad = await freshLoad(t, {}, { location: loc(href), storage });
-      let called = false;
-      bad.chrome.runtime.sendMessage = async () => { called = true; return { result: 1 }; };
-      bad.postFromPage({ type: MARKER, direction: 'request', id: 1, action: 'ping' });
-      await tick(5);
-      assert.equal(called, false, href);
-    }
-  });
-
   it('a request that arrives before storage has loaded is held, not dropped or leaked', async (t) => {
     let release;
     const gate = new Promise((r) => { release = r; });
@@ -70,19 +40,6 @@ describe('content.js origin allowlist with production + custom origin', () => {
     release();
     await tick(5);
     assert.equal(ctx.popPosted().filter((m) => m.direction === 'response').length <= 1, true);
-  });
-
-  it('ignores a corrupt / hostile stored origin', async (t) => {
-    for (const bad of ['*://*/*', 'http://evil.example.com', 'https://evil.example.com/path', '<all_urls>', 42, null]) {
-      const ctx = await freshLoad(t, {}, { location: loc('https://evil.example.com/'), storage: { clawserOrigin: bad } });
-      let called = false;
-      ctx.chrome.runtime.sendMessage = async () => { called = true; return {}; };
-      ctx.postFromPage({ type: MARKER, direction: 'request', id: 1, action: 'ping' });
-      await tick(5);
-      // 'https://evil.example.com' proper form would be valid; the malformed variants must not be.
-      if (bad === 'https://evil.example.com/path') assert.equal(called, false);
-      else assert.equal(called, false, String(bad));
-    }
   });
 
   it('content.js and background.js agree on origin validation', () => {
@@ -171,7 +128,7 @@ describe('content.js btask request bridge', () => {
   });
 
   it('refuses when this page is not an allowed origin', async (t) => {
-    const ctx = await freshLoad(t, {}, { location: loc('https://example.com/') });
+    const ctx = await freshLoad(t, {}, { location: loc('https://example.com/'), paired: false });
     const r = await ctx.requestFromBackground({ type: MARKER, direction: 'btask_request', request: REQ });
     assert.equal(r?.transportError, 'origin_not_allowed');
     assert.deepEqual(ctx.popPosted().filter((m) => m.direction === 'push'), []);
@@ -185,7 +142,7 @@ describe('content.js btask request bridge', () => {
   });
 
   it('a btask_response from a disallowed origin is ignored', async (t) => {
-    const ctx = await freshLoad(t, {}, { location: loc('https://example.com/') });
+    const ctx = await freshLoad(t, {}, { location: loc('https://example.com/'), paired: false });
     ctx.postFromPage({ type: MARKER, direction: 'btask_response', id: '1', result: {} });
     await tick();
     assert.deepEqual(ctx.popPosted(), []);

@@ -30,7 +30,7 @@ describe('page-initiated presence query', () => {
   });
 
   it('a cold, hidden background tab that missed the initial announcement connects after the query', async (t) => {
-    const ctx = await freshLoad(t, { sendMessage: async () => ({ result: [{ name: 'tabs', available: true }] }) }, { hidden: true, location: loc('https://clawser.erisera.com/#workspace/ws1') });
+    const ctx = await freshLoad(t, { sendMessage: async () => ({ paired: true, token: 't', capabilities: [{ name: 'tabs', available: true }] }) }, { hidden: true, location: loc('https://clawser.erisera.com/#workspace/ws1') });
     assert.deepEqual(ctx.popPosted(), []);
     assert.equal(ctx.liveIntervals.size, 1, 'and it keeps announcing on its own while hidden');
     ctx.postFromPage(QUERY);
@@ -51,10 +51,15 @@ describe('page-initiated presence query', () => {
     ctx.postFromOtherWindow(QUERY);
     await tick();
     assert.deepEqual(ctx.popPosted(), []);
-    const bad = await freshLoad(t, {}, { location: loc('https://example.com/') });
+  });
+
+  it('an unpaired page is told so (paired:false, no capabilities) rather than left guessing', async (t) => {
+    const bad = await freshLoad(t, {}, { location: loc('https://example.com/'), paired: false });
     bad.postFromPage(QUERY);
     await tick();
-    assert.deepEqual(bad.popPosted(), []);
+    const [p] = bad.popPosted().filter((m) => m.direction === 'presence');
+    assert.equal(p.paired, false);
+    assert.deepEqual(JSON.parse(JSON.stringify(p.capabilities)), []);
   });
 
   it('does not answer its own announcements (no loop) or other presence actions', async (t) => {

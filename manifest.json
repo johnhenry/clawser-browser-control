@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Clawser Browser Control",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Gives the Clawser agent real browser control: tabs, screenshots, DOM, input, monitoring.",
   "minimum_chrome_version": "135",
 
@@ -45,7 +45,6 @@
         "https://localhost/*",
         "http://127.0.0.1/*",
         "https://127.0.0.1/*",
-        "file:///*",
         "https://clawser.erisera.com/*"
       ],
       "js": ["content.js"],
@@ -61,7 +60,6 @@
         "https://localhost/*",
         "http://127.0.0.1/*",
         "https://127.0.0.1/*",
-        "file:///*",
         "https://clawser.erisera.com/*"
       ]
     }

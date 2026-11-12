@@ -122,6 +122,7 @@ describe('btask_draft from the side panel', () => {
   it('prefers the most recently used clawser tab', async () => {
     const other = { id: 51, windowId: 8, url: 'http://localhost:5173/', title: 'Clawser dev', lastAccessed: 999 };
     const { b, sent } = setup({ tabs: [CLAWSER_TAB, other, NEWS_TAB] });
+    await b.sendUi({ action: 'pairing_add', origin: 'http://localhost:5173' });
     await b.sendUi({ action: 'btask_draft', kind: 'extract', sources: [tabSource(NEWS_TAB)] }, PANEL);
     assert.equal(sent[0].tabId, 51);
   });
@@ -132,6 +133,7 @@ describe('btask_draft from the side panel', () => {
       tabs: [CLAWSER_TAB, other, NEWS_TAB],
       reply: (tabId) => (tabId === 51 ? { transportError: 'no_response' } : { result: { accepted: true } }),
     });
+    await b.sendUi({ action: 'pairing_add', origin: 'http://localhost:5173' });
     const r = await b.sendUi({ action: 'btask_draft', kind: 'extract', sources: [tabSource(NEWS_TAB)] }, PANEL);
     assert.equal(r.result.ok, true);
     assert.deepEqual(calls.map((s) => s.tabId), [51, 50, 50]);
