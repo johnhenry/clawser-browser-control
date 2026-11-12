@@ -253,3 +253,15 @@ describe('content.js — cancel relay (#35)', () => {
     assert.equal('cancelled' in r, false);
   });
 });
+
+describe('content.js — error codes reach the page', () => {
+  it('forwards the background\'s refusal code (not_paired / capability_disabled) next to the error', async (t) => {
+    const { postFromPage, popPosted, chrome } = await freshLoad(t);
+    chrome.runtime.sendMessage = async () => ({ error: 'not paired', code: 'not_paired' });
+    postFromPage({ type: MARKER, direction: 'request', id: 7, action: 'status' });
+    await tick(20);
+    const reply = popPosted().find((m) => m.direction === 'response');
+    assert.equal(reply.error, 'not paired');
+    assert.equal(reply.code, 'not_paired');
+  });
+});

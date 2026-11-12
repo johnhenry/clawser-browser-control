@@ -25,6 +25,15 @@ const AUDIT_LOG_MAX = 500;
 // Append-only: the only operations are recordAudit() (push) and the extension-UI
 // clear (clearAuditLog). No page-reachable action can remove entries.
 function recordAudit(entry) {
+  // A page must not be able to push earlier entries out of the log by flooding it with refused
+  // attempts: an identical refusal right after the previous one is counted, not appended.
+  const last = auditLog[auditLog.length - 1];
+  if (entry.success === false && last && last.success === false && last.action === entry.action
+    && last.tabId === entry.tabId && last.url === entry.url && last.error === entry.error && last.denied === true) {
+    last.count = (last.count || 1) + 1;
+    last.timestamp = entry.timestamp;
+    return;
+  }
   auditLog.push(entry);
   if (auditLog.length > AUDIT_LOG_MAX) auditLog.splice(0, auditLog.length - AUDIT_LOG_MAX);
 }
@@ -39,6 +48,8 @@ let inFlightCount = 0;
 const inflightRequests = new Map();
 const CANCELLED_MESSAGE = 'Cancelled';
 const isRequestId = (id) => (typeof id === 'string' && id.length > 0 && id.length <= 200) || (typeof id === 'number' && Number.isFinite(id));
+/** In-flight requests are keyed by tab and id, so another page reusing an id cannot shadow or cancel them. */
+function requestKey(sender, id) { return `${sender?.tab?.id ?? 'x'}\u0000${typeof id}\u0000${id}`; }
 function cancelledError() { const e = new Error(CANCELLED_MESSAGE); e.cancelled = true; return e; }
 
 // ── Init ──────────────────────────────────────────────────────────
@@ -123,8 +134,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!auth.ok) { recordDenied(msg, sender, auth.code); return; }
       if (msg.direction === 'notify') handleNotify(msg, sender);
       else {
-        const target = isRequestId(msg.id) ? inflightRequests.get(msg.id) : null;
-        if (target && target.tabId === (sender?.tab?.id ?? null)) target.cancel();
+        // A cancel reaches only a request of the SAME tab AND the same origin (a tab that navigated
+        // to another paired origin must not cancel the previous page's requests).
+        const target = isRequestId(msg.id) ? inflightRequests.get(requestKey(sender, msg.id)) : null;
+        if (target && target.tabId === (sender?.tab?.id ?? null) && target.origin === auth.origin) target.cancel();
       }
     });
     return false; // fire-and-forget, no response expected
@@ -163,21 +176,23 @@ function runRequest(msg, sender, sendResponse, auth) {
   // "handler finished" / "page cancelled it" happens first.
   let settled = false;
   const entryId = msg.id;
+  const entryKey = requestKey(sender, entryId);
   let entry = null;
   const settle = (reply) => {
     if (settled) return false;
     settled = true;
     inFlightCount--;
-    if (entry) inflightRequests.delete(entryId);
+    if (entry) inflightRequests.delete(entryKey);
     sendResponse(reply);
     return true;
   };
 
   // Cancellation (#35): only requests that carry an id can be cancelled.
   const controller = new AbortController();
-  if (isRequestId(entryId) && !inflightRequests.has(entryId)) {
+  if (isRequestId(entryId) && !inflightRequests.has(entryKey)) {
     entry = {
       tabId,
+      origin: auth && auth.origin,
       cancel() {
         if (settled) return;
         controller.abort();
@@ -185,7 +200,7 @@ function runRequest(msg, sender, sendResponse, auth) {
         settle({ error: CANCELLED_MESSAGE, cancelled: true });
       },
     };
-    inflightRequests.set(entryId, entry);
+    inflightRequests.set(entryKey, entry);
   }
 
   // Start on a microtask so a cancel that lands before the handler's first step skips it.
@@ -375,7 +390,7 @@ function getAvailableCapabilities(record) {
   if (!record) return caps; // unpaired: announce nothing
   if (typeof chrome !== 'undefined' && chrome.tabs) caps.push('tabs');
   if (typeof chrome !== 'undefined' && chrome.scripting) caps.push('scripting');
-  if (typeof chrome !== 'undefined' && chrome.cookies && record.caps.cookies) caps.push('cookies');
+  if (typeof chrome !== 'undefined' && chrome.cookies) caps.push('cookies'); // permission held; the per-origin gate answers a refused call with a clear error
   if (typeof chrome !== 'undefined' && chrome.webRequest) caps.push('network');
   if (record.caps.cors_fetch) caps.push('cors_fetch');
   if (record.caps.evaluate) caps.push('evaluate');
@@ -434,7 +449,19 @@ async function actionTabsList() {
   }));
 }
 
+/**
+ * Pages may open or navigate tabs only to http(s) URLs or about:blank. javascript:/data:/file:/blob:/
+ * view-source:/chrome*: URLs would run code or read local files outside the `evaluate` gate.
+ */
+function assertNavigableUrl(url) {
+  let u;
+  try { u = new URL(String(url)); } catch { throw new Error('url must be an absolute http(s) URL'); }
+  if (u.protocol === 'http:' || u.protocol === 'https:' || u.href === 'about:blank') return;
+  throw new Error(`Navigation to ${u.protocol} URLs is not allowed; use http(s)`);
+}
+
 async function actionTabOpen({ url, active }) {
+  if (url) assertNavigableUrl(url);
   // Only an explicit `active: false` opens in the background (scheduled
   // browser-task checks); anything else keeps the default of a foreground tab.
   const tab = await chrome.tabs.create({ url: url || 'about:blank', active: active !== false });
@@ -517,6 +544,7 @@ async function navigateAndWait(tid, trigger, signal) {
  */
 async function actionNavigate({ tabId, url }, signal) {
   if (!url) throw new Error('url is required');
+  assertNavigableUrl(url);
   const tid = await resolveTabId({ tabId });
   const res = await navigateAndWait(tid, () => chrome.tabs.update(tid, { url }), signal);
   if (res.url && res.url.startsWith('chrome-error://')) throw new Error(`Navigation failed: could not load ${url}`);
@@ -607,13 +635,14 @@ async function actionReadPage({ tabId, maxDepth }) {
     const refMap = {};
     // REDACTION: keep in sync with the copies in get_html and tab_watch_start (a test compares them).
     const isSensitiveField = (el) => {
-      if (!el || !el.tagName) return false;
+      if (!el || !el.tagName || typeof el.getAttribute !== 'function') return false;
       const tag = el.tagName;
-      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return false;
+      const ce = String(el.getAttribute('contenteditable') === null ? 'false' : el.getAttribute('contenteditable')).toLowerCase();
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && ce === 'false') return false;
       const attr = (n) => String(el.getAttribute(n) || '').toLowerCase();
-      if (attr('type') === 'password') return true;
+      if (attr('type') === 'password' || String(el.type || '').toLowerCase() === 'password') return true;
       if (/(^|\s)(cc-[a-z-]+|one-time-code|current-password|new-password)(\s|$)/.test(attr('autocomplete'))) return true;
-      return /card.?(number|num|no)|cc.?(num|number|exp|csc|cvc|cvv)|cvc|cvv|security.?code|one.?time|otp|totp|2fa|mfa.?code|verification.?code/.test(attr('name') + ' ' + attr('id') + ' ' + attr('inputmode'));
+      return /card.?(number|num|no)|cc.?(num|number|exp|csc|cvc|cvv)|cvc|cvv|security.?code|one.?time|otp|totp|2fa|mfa.?code|verification.?code/.test(attr('name') + ' ' + attr('id') + ' ' + attr('inputmode') + ' ' + attr('aria-label'));
     };
 
     function getRole(el) {
@@ -630,8 +659,16 @@ async function actionReadPage({ tabId, maxDepth }) {
         || el.getAttribute('title')
         || el.getAttribute('placeholder')
         || (el.labels?.[0]?.textContent?.trim())
-        || el.textContent?.trim()?.slice(0, 80)
+        || (hasSensitiveInside(el) ? '' : el.textContent?.trim()?.slice(0, 80))
         || '';
+    }
+
+    // A container's text must not carry the live text of a sensitive contenteditable / textarea inside it.
+    function hasSensitiveInside(el) {
+      if (isSensitiveField(el)) return true;
+      if (typeof el.querySelectorAll !== 'function') return false;
+      for (const f of Array.from(el.querySelectorAll('input, textarea, select, [contenteditable]'))) if (isSensitiveField(f)) return true;
+      return false;
     }
 
     function walk(node, currentDepth) {
@@ -659,7 +696,8 @@ async function actionReadPage({ tabId, maxDepth }) {
       const name = getName(node);
       if (name) entry.name = name;
 
-      if (node.value !== undefined && node.value !== '') entry.value = isSensitiveField(node) ? '[redacted]' : String(node.value).slice(0, 200);
+      if (isSensitiveField(node)) entry.value = '[redacted]';
+      else if (node.value !== undefined && node.value !== '') entry.value = String(node.value).slice(0, 200);
       if (node.disabled) entry.disabled = true;
       if (node.checked) entry.checked = true;
       if (node.tagName === 'A' && node.href) entry.href = node.href;
@@ -758,26 +796,30 @@ async function actionGetHtml({ tabId, selector, ref, strip, maxChars }) {
   return executeInTab(tid, (sel, doStrip, max) => {
     // REDACTION: keep in sync with the copies in get_html and tab_watch_start (a test compares them).
     const isSensitiveField = (el) => {
-      if (!el || !el.tagName) return false;
+      if (!el || !el.tagName || typeof el.getAttribute !== 'function') return false;
       const tag = el.tagName;
-      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return false;
+      const ce = String(el.getAttribute('contenteditable') === null ? 'false' : el.getAttribute('contenteditable')).toLowerCase();
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && ce === 'false') return false;
       const attr = (n) => String(el.getAttribute(n) || '').toLowerCase();
-      if (attr('type') === 'password') return true;
+      if (attr('type') === 'password' || String(el.type || '').toLowerCase() === 'password') return true;
       if (/(^|\s)(cc-[a-z-]+|one-time-code|current-password|new-password)(\s|$)/.test(attr('autocomplete'))) return true;
-      return /card.?(number|num|no)|cc.?(num|number|exp|csc|cvc|cvv)|cvc|cvv|security.?code|one.?time|otp|totp|2fa|mfa.?code|verification.?code/.test(attr('name') + ' ' + attr('id') + ' ' + attr('inputmode'));
+      return /card.?(number|num|no)|cc.?(num|number|exp|csc|cvc|cvv)|cvc|cvv|security.?code|one.?time|otp|totp|2fa|mfa.?code|verification.?code/.test(attr('name') + ' ' + attr('id') + ' ' + attr('inputmode') + ' ' + attr('aria-label'));
     };
     const el = sel ? document.querySelector(sel) : document.documentElement;
     if (!el) return { error: `Element not found: ${sel}` };
     // Always serialize a clone so sensitive values can be blanked without touching the page.
     const clone = el.cloneNode(true);
     const blank = (f) => {
+      if (f.tagName !== 'INPUT' && f.tagName !== 'TEXTAREA' && f.tagName !== 'SELECT') { f.textContent = '[redacted]'; return; } // contenteditable
       f.removeAttribute('value');
       f.setAttribute('value', '[redacted]');
       if (f.tagName === 'TEXTAREA') f.textContent = '[redacted]';
       if (f.tagName === 'SELECT') for (const o of Array.from(f.querySelectorAll('option'))) o.removeAttribute('selected');
     };
     if (isSensitiveField(clone)) blank(clone);
-    for (const f of Array.from(clone.querySelectorAll('input, textarea, select'))) if (isSensitiveField(f)) blank(f);
+    for (const f of Array.from(clone.querySelectorAll('input, textarea, select, [contenteditable]'))) if (isSensitiveField(f)) blank(f);
+    // An iframe's srcdoc is an HTML document of its own: its fields cannot be classified here, so drop it.
+    for (const fr of Array.from(clone.querySelectorAll('iframe'))) if (typeof fr.removeAttribute === 'function') fr.removeAttribute('srcdoc');
     if (doStrip) {
       for (const n of Array.from(clone.querySelectorAll('script, style, noscript, template, svg, iframe, link, meta'))) n.remove();
       const walker = document.createTreeWalker(clone, 128 /* NodeFilter.SHOW_COMMENT */);
@@ -1655,18 +1697,19 @@ async function actionTabWatchStart({ tabId, selector, siteProfile }) {
 
     // REDACTION: keep in sync with the copies in read_page and get_html (a test compares them).
     const isSensitiveField = (el) => {
-      if (!el || !el.tagName) return false;
+      if (!el || !el.tagName || typeof el.getAttribute !== 'function') return false;
       const tag = el.tagName;
-      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return false;
+      const ce = String(el.getAttribute('contenteditable') === null ? 'false' : el.getAttribute('contenteditable')).toLowerCase();
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && ce === 'false') return false;
       const attr = (n) => String(el.getAttribute(n) || '').toLowerCase();
-      if (attr('type') === 'password') return true;
+      if (attr('type') === 'password' || String(el.type || '').toLowerCase() === 'password') return true;
       if (/(^|\s)(cc-[a-z-]+|one-time-code|current-password|new-password)(\s|$)/.test(attr('autocomplete'))) return true;
-      return /card.?(number|num|no)|cc.?(num|number|exp|csc|cvc|cvv)|cvc|cvv|security.?code|one.?time|otp|totp|2fa|mfa.?code|verification.?code/.test(attr('name') + ' ' + attr('id') + ' ' + attr('inputmode'));
+      return /card.?(number|num|no)|cc.?(num|number|exp|csc|cvc|cvv)|cvc|cvv|security.?code|one.?time|otp|totp|2fa|mfa.?code|verification.?code/.test(attr('name') + ' ' + attr('id') + ' ' + attr('inputmode') + ' ' + attr('aria-label'));
     };
     const redactedText = (node) => {
       if (isSensitiveField(node)) return '[redacted]';
       const clone = node.cloneNode(true);
-      for (const f of Array.from(clone.querySelectorAll('input, textarea, select'))) {
+      for (const f of Array.from(clone.querySelectorAll('input, textarea, select, [contenteditable]'))) {
         if (isSensitiveField(f)) f.textContent = '[redacted]';
       }
       return clone.textContent?.trim() || '';
@@ -2086,9 +2129,8 @@ function handleNotify(msg, sender) {
     }
   } else if (msg.action === 'pod_message') {
     // Relayed via pod-inject.js's extensionBridge (InjectedPod running in
-    // the page's MAIN world) -> content.js -> here. content.js has already
-    // enforced the localhost/127.0.0.1/file:// origin allowlist before this
-    // ever reaches the background context (see content.js isAllowedOrigin()).
+    // the page's MAIN world) -> content.js -> here. The background has already checked the
+    // sender's paired origin and token (authorizeSender) before this is reached.
     recordAudit({
       timestamp: Date.now(),
       action: 'pod_message',
@@ -3179,6 +3221,7 @@ function recordDenied(msg, sender, code) {
     url: sender?.tab?.url ?? null,
     success: false,
     error: code,
+    denied: true,
   });
 }
 

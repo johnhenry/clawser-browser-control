@@ -156,10 +156,12 @@ describe('capabilities per origin', () => {
       const r = await b.call(`${DEFAULT}/`, action, params, token);
       assert.equal(r.code, 'capability_disabled', action);
     }
-    for (const c of ['evaluate', 'cookies', 'cors_fetch', 'inject_pod']) assert.ok(!capabilities.includes(c), c);
+    // 'cookies' is the coarse permission name an older app checks before calling; the per-origin gate
+    // then answers with the clear capability_disabled error instead of a misleading "missing permission".
+    for (const c of ['evaluate', 'cors_fetch', 'inject_pod']) assert.ok(!capabilities.includes(c), c);
     assert.ok(capabilities.includes('tabs'));
     const caps = (await b.call(`${DEFAULT}/`, 'get_available_capabilities', {}, token)).result;
-    assert.ok(!caps.includes('cors_fetch') && !caps.includes('cookies'));
+    assert.ok(!caps.includes('cors_fetch') && !caps.includes('evaluate'));
   });
 
   it('a person enables one capability for one origin only', async () => {
@@ -339,5 +341,109 @@ describe('redaction of sensitive fields', () => {
     assert.equal(copies.length, 3);
     assert.equal(copies[0], copies[1]);
     assert.equal(copies[1], copies[2]);
+  });
+});
+
+describe('cancel: only the sender\'s own request, tab and origin', () => {
+  const LOCAL = 'http://localhost:5173';
+  async function slowBackground() {
+    let release; const gate = new Promise((r) => { release = r; });
+    const b = strict({ scripting: { executeScript: async () => { await gate; return [{ result: { clicked: 'x' } }]; } } });
+    await b.sendUi({ action: 'pairing_add', origin: LOCAL });
+    return { b, release, tokA: (await b.hello(`${DEFAULT}/`)).token, tokB: (await b.hello(`${LOCAL}/`)).token };
+  }
+  const start = (b, url, tabId, token, replies) => b.hooks.listener({ type: '__clawser_ext__', id: 'same', action: 'click', params: { selector: '#a' }, token }, tab(url, tabId), (r) => replies.push(r));
+  const cancel = (b, url, tabId, token) => b.hooks.listener({ type: '__clawser_ext__', direction: 'cancel', id: 'same', token }, tab(url, tabId), () => {});
+
+  it('another origin in another tab cannot cancel (or shadow) a request that reuses its id', async () => {
+    const { b, release, tokA, tokB } = await slowBackground();
+    const a = []; const other = [];
+    start(b, `${DEFAULT}/`, 1, tokA, a);
+    start(b, `${LOCAL}/`, 2, tokB, other);
+    await tick(20);
+    cancel(b, `${LOCAL}/`, 2, tokB); // cancels only its own
+    await tick(20);
+    assert.equal(a.length, 0);
+    assert.equal(other[0].cancelled, true);
+    release(); await tick(20);
+    assert.equal(a[0].result.clicked, 'x');
+  });
+
+  it('a tab that navigated to another paired origin cannot cancel the previous page\'s request', async () => {
+    const { b, release, tokA, tokB } = await slowBackground();
+    const a = [];
+    start(b, `${DEFAULT}/`, 1, tokA, a);
+    await tick(20);
+    cancel(b, `${LOCAL}/`, 1, tokB); // same tab id, different origin
+    await tick(20);
+    assert.equal(a.length, 0);
+    release(); await tick(20);
+    assert.equal(a[0].result.clicked, 'x');
+  });
+});
+
+describe('audit log cannot be flooded out by a page', () => {
+  it('repeated refusals collapse into one counted entry; earlier entries survive', async () => {
+    const b = strict();
+    const { token } = await b.hello(`${DEFAULT}/`);
+    await b.call(`${DEFAULT}/`, 'status', {}, token);
+    for (let i = 0; i < 700; i++) await b.call(`${DEFAULT}/`, 'evaluate', { script: '1' }, token);
+    const log = (await b.sendUi({ action: 'audit_get' })).result.entries;
+    assert.ok(log.some((e) => e.action === 'status' && e.success), 'the earlier entry is still there');
+    const denied = log.filter((e) => e.action === 'evaluate');
+    assert.equal(denied.length, 1);
+    assert.equal(denied[0].count, 700);
+  });
+});
+
+describe('navigation schemes', () => {
+  it('navigate and tab_open refuse javascript:, data:, file:, blob:, view-source: and chrome: URLs', async () => {
+    const b = loadBackground({ tabs: { update: async () => ({}), create: async () => ({ id: 9 }) } });
+    for (const url of ['javascript:alert(1)', 'data:text/html,<script>1</script>', 'file:///etc/passwd', 'blob:https://a.test/x', 'view-source:https://a.test/', 'chrome://settings', 'not a url']) {
+      assert.match((await b.send('navigate', { url })).error, /not allowed|absolute/, url);
+      assert.match((await b.send('tab_open', { url })).error, /not allowed|absolute/, url);
+    }
+    assert.equal((await b.send('tab_open', { url: 'https://a.test/' })).result.id, 9);
+  });
+});
+
+describe('redaction: contenteditable and iframe srcdoc', () => {
+  function fakeNode(tag, attrs = {}, children = [], text = '') {
+    const n = {
+      nodeType: 1, tagName: tag.toUpperCase(), attrs: { ...attrs }, children, _text: text,
+      getAttribute(k) { return k in this.attrs ? String(this.attrs[k]) : null; },
+      setAttribute(k, v) { this.attrs[k] = v; },
+      removeAttribute(k) { delete this.attrs[k]; },
+      get textContent() { return this._text + this.children.map((c) => c.textContent).join(''); },
+      set textContent(v) { this._text = v; this.children = []; },
+      cloneNode() { return fakeNode(tag, this.attrs, this.children.map((c) => c.cloneNode()), this._text); },
+      querySelectorAll(sel) {
+        const parts = sel.split(',').map((x) => x.trim());
+        const out = [];
+        const hit = (c) => parts.some((q) => (q === '[contenteditable]' ? 'contenteditable' in c.attrs : q.toUpperCase() === c.tagName));
+        (function w(x) { for (const c of x.children) { if (hit(c)) out.push(c); w(c); } })(this);
+        return out;
+      },
+      get outerHTML() {
+        const a = Object.entries(this.attrs).map(([k, v]) => ` ${k}="${v}"`).join('');
+        return `<${tag}${a}>${this._text}${this.children.map((c) => c.outerHTML).join('')}</${tag}>`;
+      },
+    };
+    return n;
+  }
+
+  it('get_html blanks a sensitive contenteditable and drops iframe srcdoc', async () => {
+    const live = fakeNode('div', {}, [
+      fakeNode('div', { contenteditable: 'true', 'aria-label': 'one-time code' }, [], 'SECRET-VALUE'),
+      fakeNode('div', { contenteditable: '', id: 'cvc' }, [], 'SECRET-VALUE'),
+      fakeNode('div', { contenteditable: 'true', id: 'notes' }, [], 'public note'),
+      fakeNode('iframe', { srcdoc: '<input type=password value=SECRET-VALUE>' }),
+    ]);
+    let sandbox;
+    const b = loadBackground({ scripting: { executeScript: async ({ func, args }) => { sandbox.document = { documentElement: live, querySelector: () => live, createTreeWalker: () => ({ nextNode: () => null }) }; return [{ result: await func(...args) }]; } } });
+    sandbox = b.sandbox;
+    const { result } = await b.send('get_html', {});
+    assert.ok(!result.html.includes('SECRET-VALUE'));
+    assert.ok(result.html.includes('public note'));
   });
 });

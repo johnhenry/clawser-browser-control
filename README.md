@@ -58,7 +58,19 @@ The content script (the bridge between Clawser and the extension) is injected on
 - `evaluate`, `cookies`, `cors_fetch` and `inject_pod` are off for every origin until a person turns them on in the options page. Presence announcements list only what is enabled.
 - `wait` takes a `selector` or `text`; it never evaluates code.
 - `read_page`, `get_html` and watch buffers redact password fields, `autocomplete` `cc-*` / `one-time-code` fields and fields whose name or id marks them as card, CVC or one-time-code inputs.
-- The audit log is append-only. A page can read it (`audit_log`) but cannot clear it; it is cleared from the options page.
+- The audit log is append-only. A page can read it (`audit_log`) but cannot clear it; it is cleared from the options page. Identical refused attempts in a row are collapsed into one entry with a `count`, so a page cannot flood earlier entries out.
+- `navigate` and `tab_open` accept only `http(s)` URLs and `about:blank` (no `javascript:`, `data:`, `file:`, `blob:`, `view-source:` or `chrome:`).
+- Redaction also covers `contenteditable` elements whose attributes mark them as sensitive, and `get_html` drops `iframe` `srcdoc`. Shadow roots and cross-document iframes are never read.
+
+### Migrating from 0.3 (0.4.0 changes the protocol)
+
+For page authors and the Clawser app:
+
+1. **Pairing.** `https://clawser.erisera.com` and the custom origin work as before. Any other page (a localhost dev server, for instance) gets `{ error, code: 'not_paired' }` until a person pairs its exact origin (including the port) on the options page. `file:` pages no longer work. Errors now carry a `code` next to `error` on the page's response message: `not_paired`, `bad_token`, `capability_disabled`.
+2. **`wait`.** Send `selector` or `text`. A `condition` expression is rejected with an error that names these two parameters; it is never evaluated.
+3. **Opt-in capabilities.** `evaluate`, `cookies`, `cors_fetch` and `inject_pod` fail with `code: 'capability_disabled'` until a person turns them on for your origin on the options page. Check the `capabilities` action (`available`) rather than assuming.
+4. **Presence.** The announcement now carries `paired: boolean`; `capabilities` is empty while unpaired.
+5. **Navigation.** `navigate` and `tab_open` refuse non-`http(s)` URLs.
 
 ## Development
 

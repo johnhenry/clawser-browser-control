@@ -249,6 +249,7 @@ window.addEventListener('message', async (ev) => {
       error: response?.error ?? null,
     };
     if (response?.cancelled === true) reply.cancelled = true;
+    if (typeof response?.code === 'string') reply.code = response.code; // not_paired / bad_token / capability_disabled
     window.postMessage(reply, '*');
   } catch (err) {
     window.postMessage({
