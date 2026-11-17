@@ -18,6 +18,33 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BACKGROUND_SRC = readFileSync(path.join(__dirname, '..', 'background.js'), 'utf8');
 
 const MARKER = '__clawser_ext__';
+/** Stand-in sites the older suites open tabs on; granted in every loadBackground() unless opts.grants === false. */
+export const TEST_SITES = [
+  'http://localhost', 'https://localhost', 'http://localhost:5173', 'https://localhost:5173', 'http://localhost:4173',
+  'http://127.0.0.1', 'https://127.0.0.1', 'http://127.0.0.1:8080', 'https://clawser.erisera.com', 'https://clawser.example.com',
+  'https://clawser.example', 'https://c.example.com', 'https://example.com', 'https://a.test', 'https://b.test', 'https://x.test',
+  'https://app.test', 'https://evil.example', 'https://news.example.com', 'https://a.example', 'https://shop.example.com',
+  'https://evil.example.com', 'https://caller.test', 'https://two.example.com', 'https://one.example.com', 'https://shop.test',
+  'https://other.example', 'https://other.test', 'https://plain.test', 'https://s.example.com', 'http://evil.example.com',
+  'http://127.0.0.1:4173',
+  'http://172.32.0.1',
+  'http://192.168.1.2:3000',
+  'http://2130706433',
+  'http://c.example.com',
+  'http://clawser.erisera.com',
+  'http://clawser.example.com',
+  'http://localhost:5174',
+  'https://10.0.0.5',
+  'https://a.example.com',
+  'https://b.example',
+  'https://b.example.com',
+  'https://blocked.test',
+  'https://c.example',
+  'https://elsewhere.test',
+  'https://evil.test',
+  'https://x.c.example.com',
+  'https://lies.example', 'https://old-custom.example.com', 'https://clawser.example.com:8443', 'https://c.example.com:444',
+];
 export const TEST_TOKEN = 'test-token-0123456789abcdef';
 
 function shallowMergeOneLevel(base, override) {
@@ -88,6 +115,12 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   const menusCreated = []; // chrome.contextMenus.create() props, in order
   const registered = []; // chrome.scripting.registerContentScripts() entries currently registered
   const localStore = { ...(opts.storage || {}) }; // chrome.storage.local backing object
+  // Per-site grants (D21) default to none in production. The older suites exercise the tools on
+  // many stand-in hosts, so they start with those hosts granted; pass { grants: false } or your
+  // own `siteGrants` in opts.storage to test the real default.
+  if (opts.grants !== false && !('siteGrants' in localStore)) {
+    localStore.siteGrants = Object.fromEntries(TEST_SITES.map((o) => [o, { grantedAt: 1 }]));
+  }
   const sessionStore = {}; // chrome.storage.session backing object
   const badge = { text: '', title: '' }; // chrome.action state
   const panelBehavior = []; // chrome.sidePanel.setPanelBehavior() args

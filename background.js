@@ -21,6 +21,36 @@ const NETWORK_BUFFER_MAX = 200;
 /** @type {Array<{timestamp: number, action: string, tabId: number|null, url: string|null, success: boolean, error: string|null}>} */
 const auditLog = [];
 const AUDIT_LOG_MAX = 500;
+const AUDIT_KEY = 'auditLog';
+let auditLoaded = null;
+let auditSaveTimer = null;
+
+// The log survives a service-worker restart: it is mirrored to chrome.storage.local (debounced)
+// and merged back in front of anything recorded before the load finished.
+function loadAudit() {
+  if (auditLoaded) return auditLoaded;
+  auditLoaded = (async () => {
+    try {
+      const stored = await chrome.storage.local.get(AUDIT_KEY);
+      const saved = stored && stored[AUDIT_KEY];
+      if (Array.isArray(saved) && saved.length) {
+        const fresh = auditLog.splice(0, auditLog.length);
+        auditLog.push(...saved.filter((e) => e && typeof e === 'object').slice(-AUDIT_LOG_MAX), ...fresh);
+        if (auditLog.length > AUDIT_LOG_MAX) auditLog.splice(0, auditLog.length - AUDIT_LOG_MAX);
+      }
+    } catch { /* storage unavailable: the log stays in memory */ }
+  })();
+  return auditLoaded;
+}
+
+function saveAuditSoon() {
+  if (auditSaveTimer) return;
+  auditSaveTimer = setTimeout(async () => {
+    auditSaveTimer = null;
+    await loadAudit();
+    try { await chrome.storage.local.set({ [AUDIT_KEY]: auditLog.slice(-AUDIT_LOG_MAX) }); } catch { /* best effort */ }
+  }, 250);
+}
 
 // Append-only: the only operations are recordAudit() (push) and the extension-UI
 // clear (clearAuditLog). No page-reachable action can remove entries.
@@ -32,10 +62,12 @@ function recordAudit(entry) {
     && last.tabId === entry.tabId && last.url === entry.url && last.error === entry.error && last.denied === true) {
     last.count = (last.count || 1) + 1;
     last.timestamp = entry.timestamp;
+    saveAuditSoon();
     return;
   }
   auditLog.push(entry);
   if (auditLog.length > AUDIT_LOG_MAX) auditLog.splice(0, auditLog.length - AUDIT_LOG_MAX);
+  saveAuditSoon();
 }
 
 /** Cap on concurrent in-flight actions — a flood of requests from an
@@ -102,6 +134,7 @@ async function init() {
   console.log('[clawser-ext] Background initialized, userScripts:', userScriptsAvailable);
 }
 
+loadAudit();
 init();
 
 // ── Message router ────────────────────────────────────────────────
@@ -218,7 +251,8 @@ function runRequest(msg, sender, sendResponse, auth) {
       if (settled) return;
       const message = err.message || String(err);
       recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: false, error: message });
-      settle(err && err.cancelled ? { error: CANCELLED_MESSAGE, cancelled: true } : { error: message });
+      settle(err && err.cancelled ? { error: CANCELLED_MESSAGE, cancelled: true }
+        : (err && err.code === 'site_not_granted' ? { error: message, code: 'site_not_granted' } : { error: message }));
     });
 }
 
@@ -229,6 +263,7 @@ function runRequest(msg, sender, sendResponse, auth) {
  * @returns {Promise<any>}
  */
 async function handleAction(action, params, sender, signal, auth) {
+  params = await siteGate(action, params || {});
   switch (action) {
     // ── Status ──
     case 'status': return actionStatus(auth && auth.record);
@@ -282,6 +317,7 @@ async function handleAction(action, params, sender, signal, auth) {
     case 'console': return actionConsole(params);
     case 'network': return actionNetwork(params);
     case 'audit_log': return actionAuditLog();
+    case 'site_grants': return actionSiteGrants();
 
     // ── Cookies ──
     case 'cookies': return actionCookies(params);
@@ -436,7 +472,8 @@ function actionCapabilities(record) {
 // -- Tabs --
 
 async function actionTabsList() {
-  const tabs = await chrome.tabs.query({});
+  const grants = await readSites();
+  const tabs = (await chrome.tabs.query({})).filter((t) => siteOf(t.url, grants));
   return tabs.map((t) => ({
     id: t.id,
     url: t.url,
@@ -1352,12 +1389,16 @@ async function actionNetwork({ tabId, urlPattern, clear }) {
  * cleared from the extension's own UI (see clearAuditLog / handleUiMessage).
  */
 async function actionAuditLog() {
+  await loadAudit();
   return { entries: [...auditLog] };
 }
 
-function clearAuditLog() {
+async function clearAuditLog() {
+  await loadAudit();
   const n = auditLog.length;
   auditLog.length = 0;
+  if (auditSaveTimer) { clearTimeout(auditSaveTimer); auditSaveTimer = null; }
+  try { await chrome.storage.local.set({ [AUDIT_KEY]: [] }); } catch { /* best effort */ }
   return n;
 }
 
@@ -1592,7 +1633,8 @@ async function actionWebmcpListTools({ tabId } = {}) {
     if (!isWebPage(tab.url)) throw new Error('WebMCP tools can only be read from http(s) pages');
     tabs = [tab];
   } else {
-    tabs = (await chrome.tabs.query({})).filter((t) => t.id !== undefined && isWebPage(t.url)).slice(0, WEBMCP_LIMITS.maxTabs);
+    const grants = await readSites();
+    tabs = (await chrome.tabs.query({})).filter((t) => t.id !== undefined && isWebPage(t.url) && siteOf(t.url, grants)).slice(0, WEBMCP_LIMITS.maxTabs);
   }
   let skipped = 0;
   const pages = [];
@@ -3283,6 +3325,142 @@ async function pairingOverview() {
   return { origins, pending: (await getPendingOrigins()).filter((o) => !map[o]), capabilities: CAPABILITY_NAMES };
 }
 
+// ---- Per-site grants (D21: no blanket access) ----
+//
+// A paired page may act on a tab only if the TAB's exact origin is on this list. The list is
+// written only from the extension's own UI (options page) by a person; no page message can add,
+// change or remove an entry (handleUiMessage is reachable only from our own extension pages).
+// `tabs_list` and the all-tabs form of `webmcp_list_tools` show granted tabs only, and every
+// other tab-targeting action is refused with code 'site_not_granted' before it runs.
+
+const SITES_KEY = 'siteGrants';
+/** Actions that name no tab and no site: they never reach a web page. */
+const NO_SITE_ACTIONS = new Set([
+  'status', 'routine_failures', 'capabilities', 'get_available_capabilities', 'audit_log', 'site_grants',
+  'wait_cancel', 'tabs_list',
+]);
+
+let sitesChain = Promise.resolve();
+function runSitesJob(fn) {
+  const run = sitesChain.then(fn, fn);
+  sitesChain = run.catch(() => {});
+  return run;
+}
+
+async function readSites() {
+  try {
+    const stored = await chrome.storage.local.get(SITES_KEY);
+    const raw = stored && stored[SITES_KEY];
+    const out = {};
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      for (const [origin, rec] of Object.entries(raw)) {
+        const checked = normalizeSiteOrigin(origin);
+        if (checked.ok && checked.origin === origin) out[origin] = { grantedAt: Number(rec && rec.grantedAt) || 0 };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** An exact http(s) origin: no path, wildcard, credentials or `<all_urls>`. */
+function normalizeSiteOrigin(input) {
+  const fail = (error) => ({ ok: false, error });
+  if (typeof input !== 'string') return fail('Enter an origin such as https://example.com');
+  const raw = input.trim();
+  if (!raw || raw.length > 200) return fail('Enter an origin such as https://example.com');
+  if (/[\s*<>"'\\^`{|}?#]/.test(raw)) return fail('Use a plain origin: no spaces, wildcards, path, query or fragment');
+  let u;
+  try { u = new URL(raw); } catch { return fail('That is not a valid URL'); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return fail('Only http and https sites can be granted');
+  if (u.username || u.password) return fail('The origin must not contain a username or password');
+  if (u.pathname !== '/') return fail('Use only the origin, without a path');
+  return { ok: true, origin: u.origin };
+}
+
+/** The granted origin of `url`, or null (not http(s), or not on the list). */
+function siteOf(url, grants) {
+  try {
+    const u = new URL(String(url));
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return Object.prototype.hasOwnProperty.call(grants, u.origin) ? u.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+function siteRefusal(what) {
+  const e = new Error(`${what} is not a granted site. A person can grant it in the extension's options page.`);
+  e.code = 'site_not_granted';
+  return e;
+}
+
+/**
+ * Refuse a tab-targeting action whose tab (or destination URL) is on no granted site. Returns the
+ * params with `tabId` filled in when the action meant the active tab, so the action acts on the
+ * very tab that was checked.
+ */
+async function siteGate(action, params) {
+  if (NO_SITE_ACTIONS.has(action)) return params;
+  const grants = await readSites();
+  // A destination that is not an http(s) URL is left to the action's own validation, which refuses it.
+  const urlGranted = (url, label) => {
+    if (!isWebPage(url)) return;
+    if (!siteOf(url, grants)) throw siteRefusal(label || 'That site');
+  };
+  if (action === 'tab_open') {
+    if (params.url && String(params.url) !== 'about:blank') urlGranted(params.url, 'The site you are opening');
+    return params;
+  }
+  if (action === 'cookies' || action === 'cors_fetch') {
+    urlGranted(params.url, 'That site');
+    return params;
+  }
+  if (action === 'webmcp_list_tools' && (params.tabId === undefined || params.tabId === null)) return params; // filtered per tab
+  if (action === 'webmcp_call_tool' && !params.tabId) return params; // the action requires an explicit tab
+  const tabId = await resolveTabId(params);
+  const tab = await chrome.tabs.get(tabId);
+  if (action === 'webmcp_list_tools' && !isWebPage(tab && tab.url)) return { ...params, tabId }; // refused by the action itself
+  if (!siteOf(tab && tab.url, grants)) throw siteRefusal(`The site in tab ${tabId}`);
+  if (action === 'navigate' && params.url) urlGranted(params.url, 'The site you are navigating to');
+  return { ...params, tabId };
+}
+
+/** Read-only for a page: the granted origins (no tabs, no titles). */
+async function actionSiteGrants() {
+  return { sites: Object.keys(await readSites()).sort() };
+}
+
+async function sitesOverview() {
+  const grants = await readSites();
+  return { sites: Object.entries(grants).map(([origin, rec]) => ({ origin, grantedAt: rec.grantedAt })).sort((a, b) => a.origin.localeCompare(b.origin)) };
+}
+
+async function addSite(input) {
+  const checked = normalizeSiteOrigin(input);
+  if (!checked.ok) return checked;
+  await runSitesJob(async () => {
+    const stored = await chrome.storage.local.get(SITES_KEY);
+    const map = (stored && stored[SITES_KEY] && typeof stored[SITES_KEY] === 'object') ? { ...stored[SITES_KEY] } : {};
+    if (!map[checked.origin]) {
+      map[checked.origin] = { grantedAt: Date.now() };
+      await chrome.storage.local.set({ [SITES_KEY]: map });
+    }
+  });
+  return { ok: true, origin: checked.origin };
+}
+
+async function removeSite(origin) {
+  await runSitesJob(async () => {
+    const stored = await chrome.storage.local.get(SITES_KEY);
+    const map = (stored && stored[SITES_KEY] && typeof stored[SITES_KEY] === 'object') ? { ...stored[SITES_KEY] } : {};
+    delete map[origin];
+    await chrome.storage.local.set({ [SITES_KEY]: map });
+  });
+  return { ok: true };
+}
+
 // ---- UI message router ----
 
 async function handleUiMessage(msg, sender) {
@@ -3301,9 +3479,16 @@ async function handleUiMessage(msg, sender) {
     case 'pairing_set_capability':
       return setOriginCapability(msg.origin, msg.capability, msg.enabled);
     case 'audit_get':
+      await loadAudit();
       return { entries: [...auditLog] };
     case 'audit_clear':
-      return { ok: true, cleared: clearAuditLog() };
+      return { ok: true, cleared: await clearAuditLog() };
+    case 'sites_overview':
+      return sitesOverview();
+    case 'sites_add':
+      return addSite(msg.origin);
+    case 'sites_remove':
+      return removeSite(msg.origin);
     case 'btask_list':
       return btaskFetch('clawser.btask.list', 'definitions', normalizeDefinitions);
     case 'btask_inbox':

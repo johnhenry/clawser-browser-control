@@ -118,6 +118,34 @@
     } catch (e) { $('pair-error').textContent = `Not paired: ${e.message}`; }
   });
 
+  async function renderSites() {
+    const list = $('sites-list');
+    list.replaceChildren();
+    let o;
+    try { o = await call('sites_overview'); } catch (e) { say(`Could not read granted sites: ${e.message}`); return; }
+    if (o.sites.length === 0) list.append(el('p', 'No sites are granted. Pages cannot act on any tab.'));
+    for (const site of o.sites) {
+      const row = el('div', undefined, { class: 'row' });
+      row.append(el('code', site.origin));
+      const b = el('button', 'Revoke', { type: 'button', 'aria-label': `Revoke ${site.origin}` });
+      b.addEventListener('click', async () => { await call('sites_remove', { origin: site.origin }); say(`Revoked ${site.origin}`); renderSites(); });
+      row.append(b);
+      list.append(row);
+    }
+  }
+
+  $('site-form').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    $('site-error').textContent = '';
+    try {
+      const r = await call('sites_add', { origin: $('site-origin').value });
+      if (!r.ok) { $('site-error').textContent = `Not granted: ${r.error}`; return; }
+      $('site-origin').value = '';
+      say(`Granted ${r.origin}.`);
+      renderSites();
+    } catch (e) { $('site-error').textContent = `Not granted: ${e.message}`; }
+  });
+
   async function renderAudit() {
     try {
       const { entries } = await call('audit_get');
@@ -130,5 +158,6 @@
     renderAudit();
   });
   renderPairing();
+  renderSites();
   renderAudit();
 })();

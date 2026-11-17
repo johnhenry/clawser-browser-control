@@ -50,6 +50,23 @@
       </form>
     </section>
 
+    <section aria-labelledby="sites-h">
+      <h2 id="sites-h">Granted sites</h2>
+      <p class="hint">
+        A paired page can read or act on a tab only if that tab's exact origin is listed here. Nothing is granted by default,
+        and only you can add or remove a site, on this page. Tabs on other sites do not appear in tab lists and are refused.
+      </p>
+      <div id="sites-list"></div>
+      <form id="site-form" novalidate>
+        <p>
+          <label for="site-origin">Grant a site (for example <code>https://example.com</code>)</label><br>
+          <input id="site-origin" type="text" inputmode="url" autocomplete="off" spellcheck="false" size="40">
+        </p>
+        <p id="site-error" class="status" role="alert"></p>
+        <div class="row"><button type="submit" id="btn-site">Grant</button></div>
+      </form>
+    </section>
+
     <section aria-labelledby="audit-h">
       <h2 id="audit-h">Audit log</h2>
       <p class="hint">Actions pages asked for, newest last. Pages can read this log but cannot clear it.</p>
