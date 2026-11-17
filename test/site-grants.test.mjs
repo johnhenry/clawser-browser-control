@@ -50,7 +50,7 @@ describe('per-site grants', () => {
 
   it('a navigation off a granted site is refused, and revoking takes effect at once', async () => {
     const b = fresh();
-    await b.sendUi({ action: 'sites_add', origin: 'https://shop.example.com' }, UI);
+    await b.sendUi({ action: 'sites_add', origin: 'https://shop.example.com', classes: ['read', 'interact'] }, UI);
     assert.equal((await b.send('navigate', { tabId: 1, url: 'https://bank.example.org/' })).code, 'site_not_granted');
     await b.sendUi({ action: 'sites_remove', origin: 'https://shop.example.com' }, UI);
     assert.equal((await b.send('read_page', { tabId: 1 })).code, 'site_not_granted');

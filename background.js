@@ -252,7 +252,7 @@ function runRequest(msg, sender, sendResponse, auth) {
       const message = err.message || String(err);
       recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: false, error: message });
       settle(err && err.cancelled ? { error: CANCELLED_MESSAGE, cancelled: true }
-        : (err && err.code === 'site_not_granted' ? { error: message, code: 'site_not_granted' } : { error: message }));
+        : (err && (err.code === 'site_not_granted' || err.code === 'class_not_allowed') ? { error: message, code: err.code } : { error: message }));
     });
 }
 
@@ -473,7 +473,7 @@ function actionCapabilities(record) {
 
 async function actionTabsList() {
   const grants = await readSites();
-  const tabs = (await chrome.tabs.query({})).filter((t) => siteOf(t.url, grants));
+  const tabs = (await chrome.tabs.query({})).filter((t) => hasClass(t.url, grants, 'read'));
   return tabs.map((t) => ({
     id: t.id,
     url: t.url,
@@ -624,6 +624,9 @@ async function actionScreenshot({ tabId, format, quality }) {
 
   // Small delay for rendering
   await new Promise((r) => setTimeout(r, 100));
+  // The tab may have navigated during the delay: check the site it is on now.
+  const now = await chrome.tabs.get(tid);
+  if (!hasClass(now && now.url, await readSites(), 'sensitive')) throw siteRefusal(`The site in tab ${tid}`);
 
   const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
     format: format || 'png',
@@ -1364,7 +1367,33 @@ async function actionConsole({ tabId, clear }) {
     return copy;
   }, [!!clear]);
 
-  return { entries: entries || [] };
+  return { entries: (entries || []).map((e) => ({ ...e, message: scrubConsoleText(e && e.message) })) };
+}
+
+/** An address with credentials, query values and fragment removed: `https://h/p?token=[redacted]`. */
+function redactUrl(url) {
+  try {
+    const u = new URL(String(url));
+    u.username = '';
+    u.password = '';
+    u.hash = '';
+    const keys = [...new Set([...u.searchParams.keys()])];
+    u.search = '';
+    const base = u.toString();
+    return keys.length ? `${base}?${keys.map((k) => `${encodeURIComponent(k)}=[redacted]`).join('&')}` : base;
+  } catch {
+    return '[unparseable address]';
+  }
+}
+
+/** Console text with the obvious secrets blanked: bearer tokens, JWTs, `key=value` for secret-looking keys, long hex/base64 runs. */
+function scrubConsoleText(text) {
+  return String(text)
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/=-]{8,}/gi, 'Bearer [redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g, '[redacted jwt]')
+    .replace(/(\b(?:pass(?:word|wd)?|pwd|secret|token|api[_-]?key|auth|session|cookie|otp|cvc|cvv|card(?:number)?)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}]+)/gi, '$1[redacted]')
+    .replace(/\b[A-Fa-f0-9]{32,}\b/g, '[redacted]')
+    .slice(0, 1000);
 }
 
 async function actionNetwork({ tabId, urlPattern, clear }) {
@@ -1380,7 +1409,9 @@ async function actionNetwork({ tabId, urlPattern, clear }) {
     networkBuffers.set(tid, []);
   }
 
-  return { entries };
+  // Redaction (CLW-XT-14): a request address can carry a token in its query or fragment or a password in its
+  // credentials, so the page sees the address without them. (No headers or cookies are ever recorded.)
+  return { entries: entries.map((e) => ({ ...e, url: redactUrl(e.url) })) };
 }
 
 /**
@@ -1634,7 +1665,7 @@ async function actionWebmcpListTools({ tabId } = {}) {
     tabs = [tab];
   } else {
     const grants = await readSites();
-    tabs = (await chrome.tabs.query({})).filter((t) => t.id !== undefined && isWebPage(t.url) && siteOf(t.url, grants)).slice(0, WEBMCP_LIMITS.maxTabs);
+    tabs = (await chrome.tabs.query({})).filter((t) => t.id !== undefined && isWebPage(t.url) && hasClass(t.url, grants, 'read')).slice(0, WEBMCP_LIMITS.maxTabs);
   }
   let skipped = 0;
   const pages = [];
@@ -2756,11 +2787,22 @@ async function actionGifRecordStart({ tabId, fps = 2, maxDurationSec = 15, forma
       return;
     }
     try {
-      const dataUrl = await chrome.tabs.captureVisibleTab(gifRecordingState.windowId, {
-        format: gifRecordingState.format,
-        quality: gifRecordingState.quality,
+      // captureVisibleTab takes whatever tab is showing: a frame is taken only while the recorded tab is
+      // still the shown one, still on a site that allows sensitive tools. A revoked site ends the recording and drops its frames.
+      const rec = gifRecordingState;
+      const tab = await chrome.tabs.get(rec.tabId);
+      const grants = await readSites();
+      if (!hasClass(tab && tab.url, grants, 'sensitive')) {
+        clearInterval(rec.timerId);
+        if (gifRecordingState === rec) gifRecordingState = null;
+        return;
+      }
+      if (!tab.active) return;
+      const dataUrl = await chrome.tabs.captureVisibleTab(rec.windowId, {
+        format: rec.format,
+        quality: rec.quality,
       });
-      gifRecordingState.frames.push(dataUrl);
+      if (gifRecordingState === rec) rec.frames.push(dataUrl);
     } catch {
       // A transient rate-limit/quota error just drops one frame — a
       // slightly choppier GIF beats aborting the whole recording.
@@ -3334,6 +3376,42 @@ async function pairingOverview() {
 // other tab-targeting action is refused with code 'site_not_granted' before it runs.
 
 const SITES_KEY = 'siteGrants';
+
+// ---- Per-site tool classes (D21, wave X-2) ----
+//
+// A granted site also carries the CLASSES of tool a person allows on it, set only in the options page:
+//   read       look at the page: its text, structure, form values (password, payment and one-time-code
+//              fields blanked), find, wait, watch for new text, and list its WebMCP tools
+//   interact   act on the page: open, navigate, click, type, key, scroll, hover, drag, fill, select, resize,
+//              reload, close, and call a WebMCP tool the page registered (a page tool can do anything its
+//              author wrote, so calling one is interaction)
+//   sensitive  what can show a secret: screenshots and GIFs (pixels are not redacted), console and network
+//              monitoring, cookies, cors_fetch, evaluate and pod injection (the last four also need the
+//              page's own capability switch)
+// A site with no recorded classes allows `read` only. An action that is in no class is refused (fail closed).
+const SITE_CLASSES = ['read', 'interact', 'sensitive'];
+const ACTION_CLASS = {
+  tabs_list: 'read', read_page: 'read', find: 'read', get_text: 'read', get_html: 'read', wait: 'read',
+  tab_watch_start: 'read', tab_watch_poll: 'read', tab_watch_stop: 'read', webmcp_discover: 'read', webmcp_list_tools: 'read',
+  tab_open: 'interact', tab_close: 'interact', tab_activate: 'interact', tab_reload: 'interact', navigate: 'interact',
+  go_back: 'interact', go_forward: 'interact', click: 'interact', double_click: 'interact', triple_click: 'interact',
+  right_click: 'interact', hover: 'interact', drag: 'interact', scroll: 'interact', type: 'interact', key: 'interact',
+  form_input: 'interact', select_option: 'interact', resize: 'interact', webmcp_call_tool: 'interact',
+  screenshot: 'sensitive', console: 'sensitive', network: 'sensitive', gif_record_start: 'sensitive', gif_record_stop: 'sensitive',
+  cookies: 'sensitive', cors_fetch: 'sensitive', evaluate: 'sensitive', inject_pod: 'sensitive',
+};
+/** The class an action needs; an action in no class needs 'sensitive' (the strictest) and so is refused unless a person allowed everything. */
+function classOf(action) { return Object.prototype.hasOwnProperty.call(ACTION_CLASS, action) ? ACTION_CLASS[action] : 'sensitive'; }
+function cleanClasses(list) {
+  const set = new Set(Array.isArray(list) ? list.filter((c) => SITE_CLASSES.includes(c)) : []);
+  if (!set.size) set.add('read');
+  return SITE_CLASSES.filter((c) => set.has(c));
+}
+function classRefusal(origin, cls) {
+  const e = new Error(`${origin} is granted, but not for ${cls} tools. A person can allow them in the extension's options page.`);
+  e.code = 'class_not_allowed';
+  return e;
+}
 /** Actions that name no tab and no site: they never reach a web page. */
 const NO_SITE_ACTIONS = new Set([
   'status', 'routine_failures', 'capabilities', 'get_available_capabilities', 'audit_log', 'site_grants',
@@ -3355,7 +3433,7 @@ async function readSites() {
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
       for (const [origin, rec] of Object.entries(raw)) {
         const checked = normalizeSiteOrigin(origin);
-        if (checked.ok && checked.origin === origin) out[origin] = { grantedAt: Number(rec && rec.grantedAt) || 0 };
+        if (checked.ok && checked.origin === origin) out[origin] = { grantedAt: Number(rec && rec.grantedAt) || 0, classes: cleanClasses(rec && rec.classes) };
       }
     }
     return out;
@@ -3390,6 +3468,12 @@ function siteOf(url, grants) {
   }
 }
 
+/** Is `url` on a granted site that allows class `cls`? */
+function hasClass(url, grants, cls) {
+  const origin = siteOf(url, grants);
+  return !!origin && grants[origin].classes.includes(cls);
+}
+
 function siteRefusal(what) {
   const e = new Error(`${what} is not a granted site. A person can grant it in the extension's options page.`);
   e.code = 'site_not_granted';
@@ -3404,10 +3488,17 @@ function siteRefusal(what) {
 async function siteGate(action, params) {
   if (NO_SITE_ACTIONS.has(action)) return params;
   const grants = await readSites();
+  const cls = classOf(action);
+  // The site AND the class: a granted site that does not allow this class refuses it (class_not_allowed).
+  const allowed = (url, label) => {
+    const origin = siteOf(url, grants);
+    if (!origin) throw siteRefusal(label);
+    if (!grants[origin].classes.includes(cls)) throw classRefusal(origin, cls);
+  };
   // A destination that is not an http(s) URL is left to the action's own validation, which refuses it.
   const urlGranted = (url, label) => {
     if (!isWebPage(url)) return;
-    if (!siteOf(url, grants)) throw siteRefusal(label || 'That site');
+    allowed(url, label || 'That site');
   };
   if (action === 'tab_open') {
     if (params.url && String(params.url) !== 'about:blank') urlGranted(params.url, 'The site you are opening');
@@ -3419,36 +3510,53 @@ async function siteGate(action, params) {
   }
   if (action === 'webmcp_list_tools' && (params.tabId === undefined || params.tabId === null)) return params; // filtered per tab
   if (action === 'webmcp_call_tool' && !params.tabId) return params; // the action requires an explicit tab
+  if (action === 'gif_record_stop') return params; // the recording's own tab was checked when it started and on every frame
   const tabId = await resolveTabId(params);
   const tab = await chrome.tabs.get(tabId);
   if (action === 'webmcp_list_tools' && !isWebPage(tab && tab.url)) return { ...params, tabId }; // refused by the action itself
-  if (!siteOf(tab && tab.url, grants)) throw siteRefusal(`The site in tab ${tabId}`);
+  allowed(tab && tab.url, `The site in tab ${tabId}`);
   if (action === 'navigate' && params.url) urlGranted(params.url, 'The site you are navigating to');
   return { ...params, tabId };
 }
 
 /** Read-only for a page: the granted origins (no tabs, no titles). */
 async function actionSiteGrants() {
-  return { sites: Object.keys(await readSites()).sort() };
+  const grants = await readSites();
+  const origins = Object.keys(grants).sort();
+  return { sites: origins, grants: origins.map((origin) => ({ origin, classes: [...grants[origin].classes] })) };
 }
 
 async function sitesOverview() {
   const grants = await readSites();
-  return { sites: Object.entries(grants).map(([origin, rec]) => ({ origin, grantedAt: rec.grantedAt })).sort((a, b) => a.origin.localeCompare(b.origin)) };
+  return { classes: SITE_CLASSES, sites: Object.entries(grants).map(([origin, rec]) => ({ origin, grantedAt: rec.grantedAt, classes: [...rec.classes] })).sort((a, b) => a.origin.localeCompare(b.origin)) };
 }
 
-async function addSite(input) {
+async function addSite(input, classes) {
   const checked = normalizeSiteOrigin(input);
   if (!checked.ok) return checked;
   await runSitesJob(async () => {
     const stored = await chrome.storage.local.get(SITES_KEY);
     const map = (stored && stored[SITES_KEY] && typeof stored[SITES_KEY] === 'object') ? { ...stored[SITES_KEY] } : {};
     if (!map[checked.origin]) {
-      map[checked.origin] = { grantedAt: Date.now() };
+      map[checked.origin] = { grantedAt: Date.now(), classes: cleanClasses(classes) };
       await chrome.storage.local.set({ [SITES_KEY]: map });
     }
   });
   return { ok: true, origin: checked.origin };
+}
+
+/** Change the tool classes of an already granted site (options page only). */
+async function setSiteClasses(origin, classes) {
+  let found = false;
+  await runSitesJob(async () => {
+    const stored = await chrome.storage.local.get(SITES_KEY);
+    const map = (stored && stored[SITES_KEY] && typeof stored[SITES_KEY] === 'object') ? { ...stored[SITES_KEY] } : {};
+    if (!Object.prototype.hasOwnProperty.call(map, origin)) return;
+    found = true;
+    map[origin] = { ...map[origin], classes: cleanClasses(classes) };
+    await chrome.storage.local.set({ [SITES_KEY]: map });
+  });
+  return found ? { ok: true } : { ok: false, error: 'That site is not granted' };
 }
 
 async function removeSite(origin) {
@@ -3486,7 +3594,9 @@ async function handleUiMessage(msg, sender) {
     case 'sites_overview':
       return sitesOverview();
     case 'sites_add':
-      return addSite(msg.origin);
+      return addSite(msg.origin, msg.classes);
+    case 'sites_set_classes':
+      return setSiteClasses(msg.origin, msg.classes);
     case 'sites_remove':
       return removeSite(msg.origin);
     case 'btask_list':

@@ -111,7 +111,7 @@ export function makeFakeIndexedDB(store = new Map()) {
 }
 
 export function loadBackground(chromeOverrides = {}, opts = {}) {
-  const hooks = { listener: null, alarmListener: null, installedListener: null, startupListener: null, menuListener: null, tabUpdatedListeners: new Set() };
+  const hooks = { listener: null, alarmListener: null, installedListener: null, startupListener: null, menuListener: null, tabUpdatedListeners: new Set(), webRequestCompleted: [] };
   const menusCreated = []; // chrome.contextMenus.create() props, in order
   const registered = []; // chrome.scripting.registerContentScripts() entries currently registered
   const localStore = { ...(opts.storage || {}) }; // chrome.storage.local backing object
@@ -119,7 +119,7 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   // many stand-in hosts, so they start with those hosts granted; pass { grants: false } or your
   // own `siteGrants` in opts.storage to test the real default.
   if (opts.grants !== false && !('siteGrants' in localStore)) {
-    localStore.siteGrants = Object.fromEntries(TEST_SITES.map((o) => [o, { grantedAt: 1 }]));
+    localStore.siteGrants = Object.fromEntries(TEST_SITES.map((o) => [o, { grantedAt: 1, classes: ['read', 'interact', 'sensitive'] }]));
   }
   const sessionStore = {}; // chrome.storage.session backing object
   const badge = { text: '', title: '' }; // chrome.action state
@@ -144,7 +144,7 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
       query: async () => [{ id: 1, url: 'https://example.com', active: true }],
       onRemoved: { addListener: () => {} },
       onUpdated: { addListener: (fn) => { hooks.tabUpdatedListeners.add(fn); }, removeListener: (fn) => { hooks.tabUpdatedListeners.delete(fn); } },
-      get: async (id) => ({ id, windowId: 1, url: 'https://example.com' }),
+      get: async (id) => ({ id, windowId: 1, url: 'https://example.com', active: true }),
       update: async () => ({ id: 1, windowId: 1 }),
       create: async (opts) => ({ id: 999, url: opts.url, title: '' }),
       remove: async () => {},
@@ -164,7 +164,7 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
       },
       executeScript: async ({ func, args }) => [{ result: func ? func(...(args || [])) : null }],
     },
-    webRequest: { onCompleted: { addListener: () => {} } },
+    webRequest: { onCompleted: { addListener: (fn) => { hooks.webRequestCompleted.push(fn); } } },
     cookies: { getAll: async () => [] },
     contextMenus: {
       create: (props) => { menusCreated.push(props); return props.id; },

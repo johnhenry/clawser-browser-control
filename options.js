@@ -118,6 +118,12 @@
     } catch (e) { $('pair-error').textContent = `Not paired: ${e.message}`; }
   });
 
+  const CLASS_HELP = {
+    read: 'read: see the page (text, structure, form values with passwords, payment and one-time-code fields blanked), find, wait, watch, list its WebMCP tools',
+    interact: 'interact: open, navigate, click, type, fill, scroll, and call the WebMCP tools the page registered',
+    sensitive: 'sensitive: screenshots and GIFs, console and network monitoring, cookies, cors_fetch, evaluate, pod injection',
+  };
+
   async function renderSites() {
     const list = $('sites-list');
     list.replaceChildren();
@@ -127,6 +133,19 @@
     for (const site of o.sites) {
       const row = el('div', undefined, { class: 'row' });
       row.append(el('code', site.origin));
+      for (const cls of o.classes) {
+        const label = el('label', undefined, { title: CLASS_HELP[cls] });
+        const box = el('input', undefined, { type: 'checkbox', 'aria-label': `${site.origin}: allow ${cls} tools` });
+        box.checked = site.classes.includes(cls);
+        box.addEventListener('change', async () => {
+          const next = o.classes.filter((c) => (c === cls ? box.checked : site.classes.includes(c)));
+          const r = await call('sites_set_classes', { origin: site.origin, classes: next });
+          say(r.ok ? `${site.origin}: ${next.join(', ') || 'read'} tools` : r.error);
+          renderSites();
+        });
+        label.append(box, ` ${cls} `);
+        row.append(label);
+      }
       const b = el('button', 'Revoke', { type: 'button', 'aria-label': `Revoke ${site.origin}` });
       b.addEventListener('click', async () => { await call('sites_remove', { origin: site.origin }); say(`Revoked ${site.origin}`); renderSites(); });
       row.append(b);
@@ -138,7 +157,8 @@
     ev.preventDefault();
     $('site-error').textContent = '';
     try {
-      const r = await call('sites_add', { origin: $('site-origin').value });
+      const classes = ['read', 'interact', 'sensitive'].filter((c) => $(`site-class-${c}`).checked);
+      const r = await call('sites_add', { origin: $('site-origin').value, classes });
       if (!r.ok) { $('site-error').textContent = `Not granted: ${r.error}`; return; }
       $('site-origin').value = '';
       say(`Granted ${r.origin}.`);
