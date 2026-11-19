@@ -62,6 +62,15 @@ The content script (the bridge between Clawser and the extension) is injected on
 - `navigate` and `tab_open` accept only `http(s)` URLs and `about:blank` (no `javascript:`, `data:`, `file:`, `blob:`, `view-source:` or `chrome:`).
 - Redaction also covers `contenteditable` elements whose attributes mark them as sensitive, and `get_html` drops `iframe` `srcdoc`. Shadow roots and cross-document iframes are never read.
 
+### Migrating from 0.4 (0.5.0 adds per-site grants)
+
+0.5.0 adds two layers on top of pairing, both set only in the extension's options page:
+
+- **Site grants.** A paired page can only reach tabs on sites you have granted, by exact origin. A call to any other tab fails with `site_not_granted`, and `tabs_list` shows only granted sites. After updating, open the options page and grant the sites you want the page to use.
+- **Tool classes per site.** Each granted site allows `read`, `interact` and/or `sensitive` tools. A new grant allows `read` only; a call outside the site's classes fails with `capability_disabled`. `evaluate`, `cors_fetch`, `cookies` and `inject_pod` stay off by default, as in 0.4.0.
+
+The audit log now survives a service-worker restart and can still be cleared only from the extension's own UI. Network entries drop credentials, query values and fragments, console text is scrubbed of bearer tokens and secret-looking values, and GIF recording captures frames only while a granted tab that allows `sensitive` tools is shown.
+
 ### Migrating from 0.3 (0.4.0 changes the protocol)
 
 For page authors and the Clawser app:
