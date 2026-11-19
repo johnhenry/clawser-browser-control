@@ -1,7 +1,11 @@
 // Run with: node --test test/background-ssrf-guard.test.mjs
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadBackground } from './_load-background.mjs';
+import { loadBackground as load } from './_load-background.mjs';
+
+// These hosts are granted so the SSRF guard (not the site grant) is what refuses them.
+const HOSTS = ['127.0.0.1', 'localhost', '[::1]', '10.0.0.1', '172.16.0.1', '172.31.255.255', '192.168.1.1', '172.32.0.1', '2130706433'];
+const loadBackground = (c, o = {}) => load(c, { ...o, storage: { siteGrants: Object.fromEntries(HOSTS.map((h) => [`http://${h}`, { grantedAt: 1, classes: ['read', 'interact', 'sensitive'] }])) } });
 
 describe('cors_fetch SSRF guard', () => {
   it('blocks 127.0.0.1 and other loopback/localhost forms', async () => {
