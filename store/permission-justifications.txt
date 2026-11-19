@@ -1,85 +1,150 @@
-CHROME WEB STORE — PERMISSION JUSTIFICATIONS
-==============================================
-Copy-paste these into the Developer Console permission fields.
+PERMISSION JUSTIFICATIONS AND LISTING COPY
+==========================================
+Copy-paste into the store dashboards; docs/STORES.md says which field takes which block. Each permission is explained in terms of per-site grants and tool classes (read, interact, sensitive). Keep this file in step with manifest.json and firefox/manifest.json: test/packaging.test.mjs fails if a permission has no heading here, or a heading names one the manifest no longer asks for.
+
+How access works (put this in "additional notes" fields):
+Every page the extension can touch is a site the person granted, by exact origin (scheme, host and port), in the extension's own options page. A page that asks to be paired cannot grant itself anything. Each granted site also carries tool classes the person ticks there: "read" (see the page), "interact" (act on it) and "sensitive" (screenshots, GIF recording, console and network monitoring). A new grant allows "read" only. On every call the extension checks the site and the class and refuses anything else (site_not_granted, class_not_allowed, capability_disabled).
+
+=== CHROME AND EDGE ===
+Used for the Chrome Web Store and Microsoft Edge Add-ons (the same package, manifest.json).
 
 tabs
 ----
-Required to open, close, navigate, query, and manage browser tabs on behalf of the Clawser AI agent. The agent needs tab control to automate browser workflows directed by the user.
+Needed so the extension can list the open tabs and open, navigate and close them. A tab is listed to the paired Clawser page only when its site is granted; the list shows the title and origin, never the full address. Opening, navigating and closing are "interact" tools and only work on a granted site that allows that class.
 
 activeTab
 ---------
-Required to access the currently active tab when the user invokes the agent. This limits access to only the tab the user is actively working with.
+Lets the right-click entries and the side panel work on the tab the person is looking at when they choose one. It adds no access beyond the person's own click; the per-site grant still decides what the paired page may read or do afterwards.
 
 scripting
 ---------
-Required to inject content scripts into web pages so the agent can read page content (DOM), extract text, and interact with page elements as directed by the user.
+Needed to run the extension's own page reader and input code in a tab: read the text, structure and form state of the page, and click, type, fill and scroll. Reading is the "read" class and acting is the "interact" class, both checked per site; password, payment and one-time-code fields are returned blank. The extension runs only its own packaged code this way, never code from a web page or a server.
 
 userScripts
 -----------
-Required to execute user-defined scripts in the page context for advanced automation scenarios. Scripts are provided by the local Clawser workspace, not from external sources.
+Used only so a person can run a script they wrote themselves in the Clawser workspace on a page. It is off for a paired page until the person turns on the matching per-page switch in the options page, and it is never offered through the viaframe bridge. The scripts are the person's own; none are fetched from a server.
 
 webRequest
 ----------
-Required to monitor network requests on pages the agent is interacting with. This enables debugging, performance monitoring, and API response inspection as directed by the user.
+Used only to observe request metadata (method, status, type and an address with credentials, query values and fragment removed) on a granted tab that allows the "sensitive" class, while the person has started monitoring. It is observation only: no header, cookie or body is recorded, and nothing is blocked or changed.
 
 cookies
 -------
-Required to read cookie data for authentication relay when the agent needs to interact with authenticated pages on the user's behalf. Cookies are only read locally and never transmitted externally.
+Used only when a person has switched on the cookies capability for one paired page in the options page. It is off by default and is not offered through the viaframe bridge. Cookie values stay on the machine and go only to that paired page.
 
 storage
 -------
-Required to persist extension configuration settings (e.g., connection preferences) locally using chrome.storage.local. No personal data is stored.
+Keeps the extension's settings on this machine: the paired origins and their tokens, the granted sites and the classes allowed on each, the audit log and the saved browser-task state. Nothing is synced or sent anywhere.
 
 alarms
 ------
-Required to periodically check whether a scheduled Clawser routine is due to run, so routines can still fire on a schedule even when no Clawser tab is currently open.
+Wakes the extension once a minute to check whether a Clawser routine is due, so a routine can still run when the browser has no Clawser tab open. A routine unattended can reach only the sites its own signed grant names, and no others.
 
 offscreen
 ---------
-Required to encode GIF recordings of the user's tab. A Manifest V3 service worker has no DOM or canvas, so the extension decodes the captured frames and encodes the GIF in a hidden offscreen document. It is created only while a recording the user started is being encoded, shows nothing, and does not access web pages or send data anywhere.
+Needed only to encode a GIF the person asked to record: a Manifest V3 background worker has no canvas, so frames are encoded in a hidden offscreen document that exists only while encoding and sends nothing anywhere. Recording is a "sensitive" tool: it takes frames only while the shown tab is on a granted site that allows that class, and leaving the site ends it and drops the frames.
 
 sidePanel
 ---------
-Required to show the Clawser browser-tasks panel beside the page: four task launchers, a picker for the open tabs the user chooses, and the user's saved tasks, inbox and last-run status, which are read from their own Clawser tab. The panel only prepares drafts; nothing runs until the user confirms in Clawser.
+Shows the browser-tasks panel next to the page: launchers, a picker for the tabs the person chooses, and their saved tasks and inbox. It only prepares a draft message for the person's own Clawser tab; nothing runs until the person confirms in Clawser.
 
 contextMenus
 ------------
-Required to add the right-click entries "Extract data from the selection", "Extract data from this page", "Compare with other tabs" and "Watch the selection". When the user picks one, the extension records a selector and a short text hint for the selected text (or just the page address and title) and sends it to the user's Clawser tab as a draft. Nothing is read in the background and nothing runs until the user confirms in Clawser.
+Adds the right-click entries "Extract data from the selection", "Extract data from this page", "Compare with other tabs" and "Watch the selection". When the person picks one, the extension sends the page title and address, and a selector and a short text hint for a selection, to the person's Clawser tab as a draft. Nothing is read in the background and nothing runs until the person confirms.
 
 debugger (optional)
 -------------------
-Reserved for a future advanced browser-inspection feature (Chrome DevTools Protocol access for detailed page debugging). Not currently used by any action — declared as optional so it can be requested with explicit user consent if that feature ships.
+Declared optional and not used by any action in this version. It is never requested today. If a future version uses it, it would be requested at that moment with the person's consent and would be subject to the same per-site grants and "sensitive" class.
 
-Host permissions: <all_urls>
-----------------------------
-Required because the Clawser agent needs to operate on any web page the user directs it to. The extension is a general-purpose browser automation tool — the user controls which sites the agent visits. The extension only activates when commanded by the local Clawser workspace.
+<all_urls>
+----------
+Why a blanket pattern for a per-site product: Chrome and Edge only let an extension inject its page reader into a site if the manifest names that site, and a person chooses which sites at run time, so the manifest cannot list them in advance. The pattern is not the permission to use them. Access is gated in the extension by per-site grants: until a person grants a site's exact origin in the extension's own options page, every call on it is refused with site_not_granted, the tab is not listed, and nothing is read, injected or recorded. Granting a site allows "read" tools only; "interact" and "sensitive" tools are separate ticks per site, and each call is checked against them. The extension keeps an audit log a web page cannot clear. (A planned follow-up moves this to optional host permissions requested per site, so the browser asks as well.)
 
+Single purpose description
+--------------------------
+This extension lets the Clawser AI agent workspace (running on the person's own machine) work with the person's browser tabs: listing tabs, reading pages, clicking and typing, taking screenshots and watching a page, only on the sites the person grants and only for the tool classes they allow on each site.
 
-SINGLE PURPOSE DESCRIPTION
-===========================
-This extension enables the Clawser AI agent workspace (running locally) to control the browser — managing tabs, capturing screenshots, reading and interacting with web page content, simulating user input, and monitoring network activity. It acts as a bridge between the local agent and the browser, operating only when directed by the user through the Clawser workspace.
+=== FIREFOX ===
+Used for Firefox Add-ons (firefox/manifest.json). It has no sidePanel, offscreen or debugger permission. Per-site grants, the classes and the audit log work as in the Chrome build.
 
+tabs
+----
+Needed so the extension can list the open tabs and open, navigate and close them. A tab is listed to the paired Clawser page only when its site is granted; the list shows the title and origin, never the full address. Opening, navigating and closing are "interact" tools and only work on a granted site that allows that class.
 
-STORE DESCRIPTION (detailed)
-==============================
-Clawser Browser Control is the companion extension for the Clawser browser agent workspace — a browser-native AI agent runtime that runs entirely on your machine.
+activeTab
+---------
+Lets the right-click entries and the side panel work on the tab the person is looking at when they choose one. It adds no access beyond the person's own click; the per-site grant still decides what the paired page may read or do afterwards.
 
-This extension bridges your local Clawser workspace with full browser capabilities:
+scripting
+---------
+Needed to run the extension's own page reader and input code in a tab: read the text, structure and form state of the page, and click, type, fill and scroll. Reading is the "read" class and acting is the "interact" class, both checked per site; password, payment and one-time-code fields are returned blank. The extension runs only its own packaged code this way, never code from a web page or a server.
 
-• Tab Management — Open, close, navigate, and switch between tabs programmatically
-• Screenshots — Capture full-page or viewport screenshots for agent analysis
-• DOM Access — Read, query, and interact with live page elements
-• Input Simulation — Click buttons, fill forms, type text, and scroll pages
-• Network Monitoring — Observe request metadata (URL, method, status, type) for debugging
-• Cookie Access — Relay authentication state for working with logged-in sites
-• Browser Tasks — A side panel and right-click menu to start comparing tabs or extracting data; each one prepares a draft in Clawser that you confirm before anything runs
+userScripts
+-----------
+Used only so a person can run a script they wrote themselves in the Clawser workspace on a page. It is off for a paired page until the person turns on the matching per-page switch in the options page, and it is never offered through the viaframe bridge. The scripts are the person's own; none are fetched from a server.
 
-How it works:
-1. Run the Clawser workspace locally (localhost)
-2. Install this extension
-3. The agent communicates with the extension via local messaging
-4. You stay in control — the agent only acts when you direct it
+webRequest
+----------
+Used only to observe request metadata (method, status, type and an address with credentials, query values and fragment removed) on a granted tab that allows the "sensitive" class, while the person has started monitoring. It is observation only: no header, cookie or body is recorded, and nothing is blocked or changed.
 
-Privacy first: All data stays on your machine. No external servers, no tracking, no telemetry. The extension communicates only with your local Clawser workspace.
+cookies
+-------
+Used only when a person has switched on the cookies capability for one paired page in the options page. It is off by default and is not offered through the viaframe bridge. Cookie values stay on the machine and go only to that paired page.
 
-Requires Chrome 135 or later.
+storage
+-------
+Keeps the extension's settings on this machine: the paired origins and their tokens, the granted sites and the classes allowed on each, the audit log and the saved browser-task state. Nothing is synced or sent anywhere.
+
+alarms
+------
+Wakes the extension once a minute to check whether a Clawser routine is due, so a routine can still run when the browser has no Clawser tab open. A routine unattended can reach only the sites its own signed grant names, and no others.
+
+contextMenus
+------------
+Adds the right-click entries "Extract data from the selection", "Extract data from this page", "Compare with other tabs" and "Watch the selection". When the person picks one, the extension sends the page title and address, and a selector and a short text hint for a selection, to the person's Clawser tab as a draft. Nothing is read in the background and nothing runs until the person confirms.
+
+<all_urls>
+---------
+Why a blanket pattern for a per-site product: Firefox only lets an extension inject its page reader into a site if the manifest names that site, and a person chooses which sites at run time, so the manifest cannot list them in advance. The pattern is not the permission to use them. Access is gated in the extension by per-site grants: until a person grants a site's exact origin in the extension's own options page, every call on it is refused with site_not_granted, the tab is not listed, and nothing is read, injected or recorded. Granting a site allows "read" tools only; "interact" and "sensitive" tools are separate ticks per site, and each call is checked against them. The extension keeps an audit log a web page cannot clear. (A planned follow-up moves this to optional host permissions requested per site, so Firefox's own prompt asks as well.)
+
+=== LISTING COPY ===
+SHORT DESCRIPTION: Lets the Clawser agent work only in the sites you grant, with read, interact or sensitive tools you allow per site.
+FIREFOX SUMMARY: Lets the Clawser agent work in the tabs and sites you grant, one site at a time. You allow read, interact or sensitive tools for each site; everything else is refused.
+CATEGORY: Developer Tools (Chrome Web Store); Productivity or Developer Tools (Edge); Other (Firefox)
+LANGUAGE: English
+PRIVACY POLICY: https://github.com/johnhenry/clawser-browser-control/blob/main/store/privacy-policy.md
+SUPPORT: https://github.com/johnhenry/clawser-browser-control/issues
+DATA USE (Chrome "privacy practices" tab): collects no user data to a server. Certify: not sold, not used for unrelated purposes, not used for creditworthiness.
+
+--- Detailed description (Chrome Web Store, Edge Add-ons) ---
+Clawser Browser Control is the companion extension for the Clawser browser agent workspace, a browser-native AI agent runtime that runs on your machine.
+
+You decide, site by site, what Clawser can do:
+- Pair a Clawser page in the extension's own options page. A page can ask to be paired; it cannot approve itself.
+- Grant a site by its exact origin. A new grant allows "read" tools only, such as seeing the page and listing the tab.
+- Tick "interact" (open, navigate, click, type, fill, scroll) or "sensitive" (screenshots, GIF recording, console and network monitoring) for that site only if you want them.
+- Everything else is refused, and the extension keeps an audit log that a web page cannot clear.
+
+Also included: a side panel and right-click menu that prepare browser tasks (extract, compare, watch) as drafts in Clawser, and nothing runs until you confirm there.
+
+Privacy: password, payment and one-time-code fields come back blank, network entries carry no credentials or query values, and the extension has no analytics, no telemetry and no server of its own. What it reads goes only to the Clawser page you paired.
+
+Requires Chrome or Edge 135 or later.
+
+--- Detailed description (Firefox Add-ons) ---
+Clawser Browser Control is the companion extension for the Clawser browser agent workspace, a browser-native AI agent runtime that runs on your machine.
+
+You decide, site by site, what Clawser can do:
+- Pair a Clawser page in the extension's own options page. A page can ask to be paired; it cannot approve itself.
+- Grant a site by its exact origin. A new grant allows "read" tools only, such as seeing the page and listing the tab.
+- Tick "interact" (open, navigate, click, type, fill, scroll) or "sensitive" (screenshots, GIF recording, console and network monitoring) for that site only if you want them.
+- Everything else is refused, and the extension keeps an audit log that a web page cannot clear.
+
+Also included: a side panel and right-click menu that prepare browser tasks (extract, compare, watch) as drafts in Clawser, and nothing runs until you confirm there.
+
+Privacy: password, payment and one-time-code fields come back blank, network entries carry no credentials or query values, and the extension has no analytics, no telemetry and no server of its own. What it reads goes only to the Clawser page you paired.
+
+Requires Firefox 128 or later. This build has no side panel (the Chrome side panel API does not exist in Firefox); the right-click menu, GIF recording and all per-site tools are present.
+
+--- Notes for the reviewer (Edge "Notes for certification"; AMO "Notes to reviewer") ---
+To see what the extension does you need the Clawser workspace, which is a web app: https://clawser.erisera.com, or a local copy on http://localhost. Open the extension's options page (the toolbar button's menu, "Options") and under "Paired pages" press Pair next to the Clawser origin. Under "Granted sites" add a site's exact origin (for example https://example.com); a new grant allows read tools only. Without a grant every call is refused with site_not_granted, which is the behavior to expect. The extension contains no remote code: every script it runs is packaged in it. Firefox: the source in the package is unminified and has no build step (JavaScript files are the sources).
