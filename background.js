@@ -3467,12 +3467,21 @@ function runSitesJob(fn) {
   return run;
 }
 
+/**
+ * The browser's host permission pattern for an exact origin. Match patterns carry no port (Firefox rejects one, Chromium ignores it), so
+ * the permission is for the host on any port; the extension's own grant stays the exact origin, scheme and port.
+ */
+function hostPatternOf(origin) {
+  const u = new URL(origin);
+  return `${u.protocol}//${u.hostname}/*`;
+}
+
 /** Does the browser itself let the extension reach `origin`? (A grant is the person's choice; this is the browser's permission that must match it.) Fails closed. */
 async function hasHostPermission(origin) {
   try {
     const p = chrome.permissions;
     if (!p || typeof p.contains !== 'function') return false;
-    return (await p.contains({ origins: [`${origin}/*`] })) === true;
+    return (await p.contains({ origins: [hostPatternOf(origin)] })) === true;
   } catch {
     return false;
   }
@@ -3668,10 +3677,15 @@ async function removeSite(origin) {
   });
   // Take the browser's permission back too, so what the browser allows matches what the person allows. (A built-in Clawser origin is a
   // required permission and cannot be removed; that is not an error.)
+  // Another granted origin on the same host (a different port) still needs the host's permission, so it is kept then.
   let permissionRemoved = false;
   try {
     const checked = normalizeSiteOrigin(origin);
-    if (checked.ok && chrome.permissions && typeof chrome.permissions.remove === 'function') permissionRemoved = (await chrome.permissions.remove({ origins: [`${checked.origin}/*`] })) === true;
+    if (checked.ok && chrome.permissions && typeof chrome.permissions.remove === 'function') {
+      const pattern = hostPatternOf(checked.origin);
+      const stillNeeded = Object.keys(await readSites({ all: true })).some((o) => hostPatternOf(o) === pattern);
+      if (!stillNeeded) permissionRemoved = (await chrome.permissions.remove({ origins: [pattern] })) === true;
+    }
   } catch { /* required or already gone */ }
   return { ok: true, permissionRemoved };
 }

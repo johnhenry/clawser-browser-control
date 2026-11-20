@@ -18,7 +18,7 @@
   // The browser only shows its permission prompt for a call made while handling the person's click, so these run first in the
   // click handler (before any await). The background then records the grant only if the browser really holds the permission.
   // KEEP IN SYNC with normalizeSiteOrigin() in background.js (a test runs the same table through both).
-  /** `<origin>/*` for a clean http(s) origin, or null (the background then explains what is wrong). */
+  /** `<scheme>://<host>/*` (a match pattern has no port; the extension's grant stays the exact origin) for a clean http(s) origin, or null (the background then explains what is wrong). */
   function hostPattern(input) {
     if (typeof input !== 'string') return null;
     const raw = input.trim();
@@ -26,7 +26,7 @@
     let u;
     try { u = new URL(raw); } catch { return null; }
     if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.username || u.password || u.pathname !== '/') return null;
-    return `${u.origin}/*`;
+    return `${u.protocol}//${u.hostname}/*`;
   }
   const perms = () => chrome.permissions;
   /** Ask the browser for one origin. Resolves true only if the person approved its prompt. */

@@ -123,7 +123,7 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   }
   // The browser's own host permissions (wave R-3): by default every origin is held, so the older suites stay about what they test. Pass
   // { hostPermissions: false } for none, or an array of origins ("https://a.test") to hold only those. The set is returned as `hostPerms`.
-  const hostPerms = { all: opts.hostPermissions === undefined, set: new Set((Array.isArray(opts.hostPermissions) ? opts.hostPermissions : []).map((o) => (o === '<all_urls>' ? o : `${o}/*`))), removed: [], requested: [] };
+  const hostPerms = { all: opts.hostPermissions === undefined, set: new Set((Array.isArray(opts.hostPermissions) ? opts.hostPermissions : []).map((o) => (o === '<all_urls>' ? o : `${new URL(o).protocol}//${new URL(o).hostname}/*`))), removed: [], requested: [] };
   const sessionStore = {}; // chrome.storage.session backing object
   const badge = { text: '', title: '' }; // chrome.action state
   const panelBehavior = []; // chrome.sidePanel.setPanelBehavior() args

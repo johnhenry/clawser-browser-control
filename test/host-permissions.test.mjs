@@ -71,6 +71,19 @@ describe('a grant counts only while the browser also holds the permission', () =
 });
 
 describe('revoking', () => {
+  it('keeps the host permission while another granted origin on the same host (another port) needs it', async () => {
+    const b = fresh({ hostPermissions: ['https://shop.example.com'] });
+    await b.sendUi({ action: 'sites_add', origin: 'https://shop.example.com:8443' }, UI);
+    await b.sendUi({ action: 'sites_add', origin: SHOP }, UI);
+    await b.sendUi({ action: 'sites_remove', origin: SHOP }, UI);
+    assert.deepEqual(b.hostPerms.removed, [], 'the other port still needs the host permission');
+    await b.sendUi({ action: 'sites_remove', origin: 'https://shop.example.com:8443' }, UI);
+    assert.deepEqual([...b.hostPerms.removed], [`${SHOP}/*`]);
+  });
+  it('asks the browser for a host pattern with no port, since a match pattern has none', async () => {
+    const b = fresh({ hostPermissions: ['http://localhost'] });
+    assert.equal((await b.sendUi({ action: 'sites_add', origin: 'http://localhost:5173' }, UI)).result.ok, true);
+  });
   it('removes the grant and the browser permission, and the site is refused afterwards', async () => {
     const b = fresh({ hostPermissions: [SHOP] });
     await b.sendUi({ action: 'sites_add', origin: SHOP }, UI);
@@ -157,7 +170,7 @@ describe('the options page asks for the same origin the background would grant',
     it(`agrees on ${JSON.stringify(c).slice(0, 40)}`, () => {
       const bg = b.sandbox.normalizeSiteOrigin(c);
       const pat = ctx.hostPattern(c);
-      if (bg.ok) assert.equal(pat, `${bg.origin}/*`);
+      if (bg.ok) assert.equal(pat, `${new URL(bg.origin).protocol}//${new URL(bg.origin).hostname}/*`);
       else assert.equal(pat, null);
     });
   }
