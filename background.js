@@ -252,7 +252,7 @@ function runRequest(msg, sender, sendResponse, auth) {
       const message = err.message || String(err);
       recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: false, error: message });
       settle(err && err.cancelled ? { error: CANCELLED_MESSAGE, cancelled: true }
-        : (err && ['site_not_granted', 'class_not_allowed', 'site_permission_needed', 'not_in_build'].includes(err.code) ? { error: message, code: err.code } : { error: message }));
+        : (err && ['site_not_granted', 'class_not_allowed', 'site_permission_needed', 'not_in_build', 'capture_not_enabled'].includes(err.code) ? { error: message, code: err.code } : { error: message }));
     });
 }
 
@@ -625,6 +625,7 @@ async function actionScreenshot({ tabId, format, quality }) {
   // Small delay for rendering
   await new Promise((r) => setTimeout(r, 100));
   // The tab may have navigated during the delay: check the site it is on now.
+  await requireCapture();
   const now = await chrome.tabs.get(tid);
   if (!hasClass(now && now.url, await readSites(), 'sensitive')) throw siteRefusal(`The site in tab ${tid}`);
 
@@ -2778,6 +2779,7 @@ async function actionGifRecordStart({ tabId, fps = 2, maxDurationSec = 15, forma
   if (gifRecordingState) throw new Error('A GIF recording is already in progress');
   if (!(maxDurationSec > 0 && maxDurationSec <= 60)) throw new Error('maxDurationSec must be between 1 and 60');
 
+  await requireCapture();
   const tid = await resolveTabId({ tabId });
   const tab = await chrome.tabs.get(tid);
   await chrome.tabs.update(tid, { active: true });
@@ -2816,6 +2818,11 @@ async function actionGifRecordStart({ tabId, fps = 2, maxDurationSec = 15, forma
         return;
       }
       if (!tab.active) return;
+      if (!(await captureEnabled())) { // the person turned the all-sites access off: end the recording and drop its frames
+        clearInterval(rec.timerId);
+        if (gifRecordingState === rec) gifRecordingState = null;
+        return;
+      }
       const dataUrl = await chrome.tabs.captureVisibleTab(rec.windowId, {
         format: rec.format,
         quality: rec.quality,
@@ -3534,6 +3541,29 @@ function permissionRefusal(origin) {
   return e;
 }
 
+// ---- Pixels need the browser's all-sites access (wave R-3) ----
+//
+// chrome.tabs.captureVisibleTab works only when the extension holds <all_urls> (or activeTab, which a person's click grants for one
+// tab at a time and so cannot serve an agent-driven call). So screenshots and GIF frames are a separate, off-by-default switch in the
+// options page that asks the browser for <all_urls>. Every other tool works on the per-site permission alone. With the switch on the
+// extension's own gates (the granted-site list and the tool classes) still decide which sites are captured.
+async function captureEnabled() {
+  try {
+    const p = chrome.permissions;
+    if (!p || typeof p.contains !== 'function') return false;
+    return (await p.contains({ origins: ['<all_urls>'] })) === true;
+  } catch {
+    return false;
+  }
+}
+
+async function requireCapture() {
+  if (await captureEnabled()) return;
+  const e = new Error("Screenshots and GIFs need the browser's all-sites access, which is off. A person can turn it on in the extension's options page.");
+  e.code = 'capture_not_enabled';
+  throw e;
+}
+
 function siteRefusal(what) {
   const e = new Error(`${what} is not a granted site. A person can grant it in the extension's options page.`);
   e.code = 'site_not_granted';
@@ -3594,7 +3624,7 @@ async function sitesOverview() {
   const stored = await chrome.storage.local.get(MIGRATION_KEY).catch(() => ({}));
   const m = stored && stored[MIGRATION_KEY];
   const migration = m && typeof m === 'object' ? { from: String(m.from || ''), at: Number(m.at) || 0, needing: sites.filter((x) => !x.permitted && Array.isArray(m.origins) && m.origins.includes(x.origin)).map((x) => x.origin) } : null;
-  return { classes: SITE_CLASSES, sites, migration: migration && migration.needing.length ? migration : null };
+  return { classes: SITE_CLASSES, sites, capture: await captureEnabled(), migration: migration && migration.needing.length ? migration : null };
 }
 
 async function addSite(input, classes) {

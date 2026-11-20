@@ -154,6 +154,10 @@
     list.replaceChildren();
     let o;
     try { o = await call('sites_overview'); } catch (e) { say(`Could not read granted sites: ${e.message}`); return; }
+    const cap = $('capture-state');
+    cap.textContent = o.capture ? 'On: the browser has given the extension access to all sites so it can capture pixels. The extension still captures only granted sites that allow sensitive tools.' : 'Off: screenshots and GIF recording are refused.';
+    $('btn-capture-on').hidden = o.capture === true;
+    $('btn-capture-off').hidden = o.capture !== true;
     const banner = $('migration-note');
     if (o.migration) {
       banner.hidden = false;
@@ -216,6 +220,18 @@
       say(`Granted ${r.origin}.`);
       renderSites();
     } catch (e) { $('site-error').textContent = `Not granted: ${e.message}`; }
+  });
+
+  // The browser's screenshot API works only with access to all sites, so pixels are a separate switch (first line of the click handler: the prompt needs it).
+  $('btn-capture-on').addEventListener('click', async () => {
+    const ok = await askBrowser('<all_urls>');
+    say(ok ? 'Screenshots and GIFs are on.' : 'The browser did not give access to all sites. Screenshots and GIFs stay off.');
+    renderSites();
+  });
+  $('btn-capture-off').addEventListener('click', async () => {
+    try { await perms().remove({ origins: ['<all_urls>'] }); } catch { /* not held */ }
+    say('Screenshots and GIFs are off.');
+    renderSites();
   });
 
   async function renderAudit() {

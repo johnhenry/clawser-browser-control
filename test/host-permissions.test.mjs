@@ -167,3 +167,28 @@ describe('the options page asks for the same origin the background would grant',
     assert.ok(!/permissions\.request/.test(read('background.js').replace(/\/\/.*|\/\*[\s\S]*?\*\//g, '')), 'the background never calls permissions.request (it has no user gesture)');
   });
 });
+
+describe('screenshots and GIFs need the browser\'s all-sites access, which is a separate switch (off by default)', () => {
+  const grants = { [SHOP]: { grantedAt: 1, classes: ['read', 'interact', 'sensitive'] } };
+  it('with only the per-site permission, screenshot and GIF recording are refused with capture_not_enabled and capture nothing', async () => {
+    let captured = 0;
+    const b = loadBackground({ ...chromeStub, tabs: { ...chromeStub.tabs, captureVisibleTab: async () => { captured++; return 'data:image/jpeg;base64,AAA'; } } }, { grants: false, hostPermissions: [SHOP], storage: { siteGrants: grants } });
+    assert.equal((await b.send('screenshot', { tabId: 1 })).code, 'capture_not_enabled');
+    assert.equal((await b.send('gif_record_start', { tabId: 1 })).code, 'capture_not_enabled');
+    assert.equal(captured, 0);
+    assert.equal((await b.send('get_text', { tabId: 1 })).code, undefined, 'every other tool works on the per-site permission alone');
+    assert.equal((await b.sendUi({ action: 'sites_overview' }, UI)).result.capture, false);
+  });
+  it('once the person turns the switch on (the browser holds <all_urls>) a granted site can be captured, and an ungranted one still cannot', async () => {
+    const b = loadBackground({ ...chromeStub, tabs: { ...chromeStub.tabs, captureVisibleTab: async () => 'data:image/jpeg;base64,AAA' } }, { grants: false, hostPermissions: [SHOP, '<all_urls>'], storage: { siteGrants: grants } });
+    assert.ok((await b.send('screenshot', { tabId: 1 })).result.dataUrl);
+    assert.equal((await b.sendUi({ action: 'sites_overview' }, UI)).result.capture, true);
+    const b2 = loadBackground({ ...chromeStub, tabs: { ...chromeStub.tabs, captureVisibleTab: async () => 'data:image/jpeg;base64,AAA' } }, { grants: false, hostPermissions: ['<all_urls>'] });
+    assert.equal((await b2.send('screenshot', { tabId: 1 })).code, 'site_not_granted');
+  });
+  it('the options page has the switch, asks the browser from the click, and the background never requests', () => {
+    const html = read('options.html'); const js = read('options.js');
+    assert.match(html, /id="btn-capture-on"/);
+    assert.match(js, /askBrowser\('<all_urls>'\)/);
+  });
+});
