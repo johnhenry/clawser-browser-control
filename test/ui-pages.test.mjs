@@ -21,8 +21,12 @@ describe('manifests', () => {
     it(`${name}: content script matches are exactly the hardened set plus production clawser`, () => {
       assert.deepEqual([...m.content_scripts[0].matches].sort(), [...MATCHES].sort());
     });
-    it(`${name}: web_accessible_resources matches follow the same set`, () => {
-      assert.deepEqual([...m.web_accessible_resources[0].matches].sort(), [...MATCHES].sort());
+    it(`${name}: no web_accessible_resources in the default build (pod-inject.js is opt-in, CLW-XT-05)`, () => {
+      assert.equal(m.web_accessible_resources, undefined);
+    });
+    it(`${name}: host_permissions are only the built-in Clawser origins; every other site is an optional permission`, () => {
+      assert.deepEqual([...m.host_permissions].sort(), [...MATCHES].sort());
+      assert.deepEqual(m.optional_host_permissions, ['<all_urls>']);
     });
     it(`${name}: requests contextMenus`, () => assert.ok(m.permissions.includes('contextMenus')));
     it(`${name}: has an options page`, () => {
@@ -41,7 +45,7 @@ describe('manifests', () => {
   it('chrome: only sidePanel and contextMenus were added to permissions; no new host access', () => {
     const base = ['tabs', 'activeTab', 'scripting', 'userScripts', 'webRequest', 'cookies', 'storage', 'alarms', 'offscreen'];
     assert.deepEqual([...chromeManifest.permissions].sort(), [...base, 'sidePanel', 'contextMenus'].sort());
-    assert.deepEqual(chromeManifest.host_permissions, ['<all_urls>']);
+    assert.ok(!chromeManifest.host_permissions.includes('<all_urls>'));
   });
   it('Chrome and Firefox manifests carry the same version', () => {
     assert.equal(firefoxManifest.version, chromeManifest.version);

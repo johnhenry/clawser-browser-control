@@ -3,7 +3,7 @@ PERMISSION JUSTIFICATIONS AND LISTING COPY
 Copy-paste into the store dashboards; docs/STORES.md says which field takes which block. Each permission is explained in terms of per-site grants and tool classes (read, interact, sensitive). Keep this file in step with manifest.json and firefox/manifest.json: test/packaging.test.mjs fails if a permission has no heading here, or a heading names one the manifest no longer asks for.
 
 How access works (put this in "additional notes" fields):
-Every page the extension can touch is a site the person granted, by exact origin (scheme, host and port), in the extension's own options page. A page that asks to be paired cannot grant itself anything. Each granted site also carries tool classes the person ticks there: "read" (see the page), "interact" (act on it) and "sensitive" (screenshots, GIF recording, console and network monitoring). A new grant allows "read" only. On every call the extension checks the site and the class and refuses anything else (site_not_granted, class_not_allowed, capability_disabled).
+Every page the extension can touch is a site the person granted, by exact origin (scheme, host and port), in the extension's own options page, and the browser holds access to that one origin only (optional host permission, requested when the person grants it, removed when they revoke it). A page that asks to be paired cannot grant itself anything. Each granted site also carries tool classes the person ticks there: "read" (see the page), "interact" (act on it) and "sensitive" (screenshots, GIF recording, console and network monitoring). A new grant allows "read" only. On every call the extension checks the site and the class and refuses anything else (site_not_granted, class_not_allowed, capability_disabled).
 
 === CHROME AND EDGE ===
 Used for the Chrome Web Store and Microsoft Edge Add-ons (the same package, manifest.json).
@@ -56,9 +56,31 @@ debugger (optional)
 -------------------
 Declared optional and not used by any action in this version. It is never requested today. If a future version uses it, it would be requested at that moment with the person's consent and would be subject to the same per-site grants and "sensitive" class.
 
-<all_urls>
-----------
-Why a blanket pattern for a per-site product: Chrome and Edge only let an extension inject its page reader into a site if the manifest names that site, and a person chooses which sites at run time, so the manifest cannot list them in advance. The pattern is not the permission to use them. Access is gated in the extension by per-site grants: until a person grants a site's exact origin in the extension's own options page, every call on it is refused with site_not_granted, the tab is not listed, and nothing is read, injected or recorded. Granting a site allows "read" tools only; "interact" and "sensitive" tools are separate ticks per site, and each call is checked against them. The extension keeps an audit log a web page cannot clear. (A planned follow-up moves this to optional host permissions requested per site, so the browser asks as well.)
+http://localhost/*
+------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+https://localhost/*
+-------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+http://127.0.0.1/*
+------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+https://127.0.0.1/*
+-------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+https://clawser.erisera.com/*
+-----------------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+<all_urls> (optional)
+----------------------
+Declared under optional_host_permissions, so it is NOT held at install and the browser shows no "read and change all your data on all websites" warning. The extension asks the browser for access one site at a time: when a person grants a site's exact origin in the extension's own options page, the page calls permissions.request for just that origin, and the browser shows its own prompt for it. Revoking the site in the options page removes that permission again. Chrome and Edge only let an extension inject its page reader into a site it holds permission for, and the person chooses the sites at run time, so the manifest cannot list them: that is why the optional pattern is declared.
+Access is also gated in the extension itself, in two independent layers. A site must be on the person's list of granted origins, and the browser must hold the matching permission; if either is missing, every call on it is refused (site_not_granted or site_permission_needed), the tab is not listed, and nothing is read, injected or recorded. Granting a site allows "read" tools only; "interact" and "sensitive" tools are separate ticks per site, and each call is checked against them. The extension keeps an audit log a web page cannot clear.
+Updating from 0.5.0: 0.5.0 held the blanket pattern. After the update the options page lists the sites already granted that need to be approved again, one click each, and the extension refuses them until the person does.
 
 Single purpose description
 --------------------------
@@ -103,9 +125,31 @@ contextMenus
 ------------
 Adds the right-click entries "Extract data from the selection", "Extract data from this page", "Compare with other tabs" and "Watch the selection". When the person picks one, the extension sends the page title and address, and a selector and a short text hint for a selection, to the person's Clawser tab as a draft. Nothing is read in the background and nothing runs until the person confirms.
 
-<all_urls>
----------
-Why a blanket pattern for a per-site product: Firefox only lets an extension inject its page reader into a site if the manifest names that site, and a person chooses which sites at run time, so the manifest cannot list them in advance. The pattern is not the permission to use them. Access is gated in the extension by per-site grants: until a person grants a site's exact origin in the extension's own options page, every call on it is refused with site_not_granted, the tab is not listed, and nothing is read, injected or recorded. Granting a site allows "read" tools only; "interact" and "sensitive" tools are separate ticks per site, and each call is checked against them. The extension keeps an audit log a web page cannot clear. (A planned follow-up moves this to optional host permissions requested per site, so Firefox's own prompt asks as well.)
+http://localhost/*
+------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+https://localhost/*
+-------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+http://127.0.0.1/*
+------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+https://127.0.0.1/*
+-------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+https://clawser.erisera.com/*
+-----------------------------
+The Clawser web app's own origin, so the extension's relay script can run on the page you pair. It is not access to any other site, and it grants no tool on its own: pairing and per-site grants still decide everything.
+
+<all_urls> (optional)
+----------------------
+Declared under optional_host_permissions, so it is NOT held at install and the browser shows no "read and change all your data on all websites" warning. The extension asks the browser for access one site at a time: when a person grants a site's exact origin in the extension's own options page, the page calls permissions.request for just that origin, and the browser shows its own prompt for it. Revoking the site in the options page removes that permission again. Firefox only let an extension inject its page reader into a site it holds permission for, and the person chooses the sites at run time, so the manifest cannot list them: that is why the optional pattern is declared.
+Access is also gated in the extension itself, in two independent layers. A site must be on the person's list of granted origins, and the browser must hold the matching permission; if either is missing, every call on it is refused (site_not_granted or site_permission_needed), the tab is not listed, and nothing is read, injected or recorded. Granting a site allows "read" tools only; "interact" and "sensitive" tools are separate ticks per site, and each call is checked against them. The extension keeps an audit log a web page cannot clear.
+Updating from 0.5.0: 0.5.0 held the blanket pattern. After the update the options page lists the sites already granted that need to be approved again, one click each, and the extension refuses them until the person does.
 
 === LISTING COPY ===
 SHORT DESCRIPTION: Lets the Clawser agent work only in the sites you grant, with read, interact or sensitive tools you allow per site.

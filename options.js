@@ -14,6 +14,26 @@
     return resp.result;
   }
 
+  // ---- Browser permission for a site ----
+  // The browser only shows its permission prompt for a call made while handling the person's click, so these run first in the
+  // click handler (before any await). The background then records the grant only if the browser really holds the permission.
+  // KEEP IN SYNC with normalizeSiteOrigin() in background.js (a test runs the same table through both).
+  /** `<origin>/*` for a clean http(s) origin, or null (the background then explains what is wrong). */
+  function hostPattern(input) {
+    if (typeof input !== 'string') return null;
+    const raw = input.trim();
+    if (!raw || raw.length > 200 || /[\s*<>"'\\^`{|}?#]/.test(raw)) return null;
+    let u;
+    try { u = new URL(raw); } catch { return null; }
+    if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.username || u.password || u.pathname !== '/') return null;
+    return `${u.origin}/*`;
+  }
+  const perms = () => chrome.permissions;
+  /** Ask the browser for one origin. Resolves true only if the person approved its prompt. */
+  async function askBrowser(pattern) {
+    try { return (await perms().request({ origins: [pattern] })) === true; } catch { return false; }
+  }
+
   async function load() {
     try {
       const r = await call('get_clawser_origin');
@@ -27,6 +47,11 @@
   async function save(value) {
     $('origin-error').textContent = '';
     try {
+      const pattern = hostPattern(value);
+      if (pattern && !(await askBrowser(pattern))) {
+        $('origin-error').textContent = 'Not saved: the browser did not give the extension access to that origin.';
+        return;
+      }
       const r = await call('set_clawser_origin', { origin: value });
       if (!r.ok) {
         $('origin-error').textContent = `Not saved: ${r.error}`;
@@ -42,7 +67,7 @@
     }
   }
 
-  $('origin-form').addEventListener('submit', (ev) => { ev.preventDefault(); save($('origin').value); });
+  $('origin-form').addEventListener('submit', (ev) => { ev.preventDefault(); const v = $('origin').value; save(v); });
   $('btn-reset').addEventListener('click', () => { $('origin').value = ''; save(''); });
   load();
 
@@ -121,7 +146,7 @@
   const CLASS_HELP = {
     read: 'read: see the page (text, structure, form values with passwords, payment and one-time-code fields blanked), find, wait, watch, list its WebMCP tools',
     interact: 'interact: open, navigate, click, type, fill, scroll, and call the WebMCP tools the page registered',
-    sensitive: 'sensitive: screenshots and GIFs, console and network monitoring, cookies, cors_fetch, evaluate, pod injection',
+    sensitive: 'sensitive: screenshots and GIFs, console and network monitoring, cookies, cors_fetch, evaluate',
   };
 
   async function renderSites() {
@@ -129,10 +154,28 @@
     list.replaceChildren();
     let o;
     try { o = await call('sites_overview'); } catch (e) { say(`Could not read granted sites: ${e.message}`); return; }
+    const banner = $('migration-note');
+    if (o.migration) {
+      banner.hidden = false;
+      banner.textContent = `Updated from ${o.migration.from}. Version 0.6 no longer asks the browser for access to every site. ${o.migration.needing.length} granted site${o.migration.needing.length === 1 ? ' needs' : 's need'} your approval again (marked below): until you approve one, the extension refuses it.`;
+    } else {
+      banner.hidden = true;
+      banner.textContent = '';
+    }
     if (o.sites.length === 0) list.append(el('p', 'No sites are granted. Pages cannot act on any tab.'));
     for (const site of o.sites) {
       const row = el('div', undefined, { class: 'row' });
       row.append(el('code', site.origin));
+      if (!site.permitted) {
+        row.append(el('strong', ' needs approval in the browser '));
+        const a = el('button', 'Approve', { type: 'button', 'aria-label': `Approve browser access to ${site.origin}` });
+        a.addEventListener('click', async () => {
+          const ok = await askBrowser(hostPattern(site.origin));
+          say(ok ? `${site.origin}: approved.` : `${site.origin}: the browser did not give access.`);
+          renderSites();
+        });
+        row.append(a);
+      }
       for (const cls of o.classes) {
         const label = el('label', undefined, { title: CLASS_HELP[cls] });
         const box = el('input', undefined, { type: 'checkbox', 'aria-label': `${site.origin}: allow ${cls} tools` });
@@ -156,10 +199,19 @@
   $('site-form').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     $('site-error').textContent = '';
+    const typed = $('site-origin').value;
+    const pattern = hostPattern(typed);
+    // First, and before any await: the browser's prompt needs this click.
+    const asked = pattern ? askBrowser(pattern) : Promise.resolve(true);
     try {
+      if (!(await asked)) { $('site-error').textContent = 'Not granted: the browser did not give the extension access to that site.'; return; }
       const classes = ['read', 'interact', 'sensitive'].filter((c) => $(`site-class-${c}`).checked);
-      const r = await call('sites_add', { origin: $('site-origin').value, classes });
-      if (!r.ok) { $('site-error').textContent = `Not granted: ${r.error}`; return; }
+      const r = await call('sites_add', { origin: typed, classes });
+      if (!r.ok) {
+        if (pattern) { try { await perms().remove({ origins: [pattern] }); } catch { /* ignore */ } }
+        $('site-error').textContent = `Not granted: ${r.error}`;
+        return;
+      }
       $('site-origin').value = '';
       say(`Granted ${r.origin}.`);
       renderSites();

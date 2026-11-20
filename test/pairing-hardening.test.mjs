@@ -147,9 +147,9 @@ describe('stored custom origin', () => {
 });
 
 describe('capabilities per origin', () => {
-  const GATED = [['evaluate', { script: '1+1' }], ['cookies', { url: 'https://a.test/' }], ['cors_fetch', { url: 'https://a.test/' }], ['inject_pod', { tabId: 2 }]];
+  const GATED = [['evaluate', { script: '1+1' }], ['cookies', { url: 'https://a.test/' }], ['cors_fetch', { url: 'https://a.test/' }]];
 
-  it('evaluate, cookies, cors_fetch and inject_pod are off by default and announced as off', async () => {
+  it('evaluate, cookies and cors_fetch are off by default and announced as off; inject_pod is not in the default build at all', async () => {
     const b = strict();
     const { token, capabilities } = await b.hello(`${DEFAULT}/`);
     for (const [action, params] of GATED) {
@@ -159,6 +159,7 @@ describe('capabilities per origin', () => {
     // 'cookies' is the coarse permission name an older app checks before calling; the per-origin gate
     // then answers with the clear capability_disabled error instead of a misleading "missing permission".
     for (const c of ['evaluate', 'cors_fetch', 'inject_pod']) assert.ok(!capabilities.includes(c), c);
+    assert.ok(!(await b.sendUi({ action: 'pairing_overview' })).result.capabilities.includes('inject_pod'), 'no inject_pod switch to turn on in the default build');
     assert.ok(capabilities.includes('tabs'));
     const caps = (await b.call(`${DEFAULT}/`, 'get_available_capabilities', {}, token)).result;
     assert.ok(!caps.includes('cors_fetch') && !caps.includes('evaluate'));

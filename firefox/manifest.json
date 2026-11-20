@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Clawser Browser Control",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Gives the Clawser agent real browser control: tabs, screenshots, DOM, input, monitoring.",
 
   "browser_specific_settings": {
@@ -23,7 +23,14 @@
     "alarms",
     "contextMenus"
   ],
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "http://localhost/*",
+    "https://localhost/*",
+    "http://127.0.0.1/*",
+    "https://127.0.0.1/*",
+    "https://clawser.erisera.com/*"
+  ],
+  "optional_host_permissions": ["<all_urls>"],
 
   "options_ui": {
     "page": "options.html",
@@ -45,19 +52,6 @@
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
-    }
-  ],
-
-  "web_accessible_resources": [
-    {
-      "resources": ["pod-inject.js"],
-      "matches": [
-        "http://localhost/*",
-        "https://localhost/*",
-        "http://127.0.0.1/*",
-        "https://127.0.0.1/*",
-        "https://clawser.erisera.com/*"
-      ]
     }
   ],
 

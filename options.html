@@ -54,8 +54,9 @@
       <h2 id="sites-h">Granted sites</h2>
       <p class="hint">
         A paired page can read or act on a tab only if that tab's exact origin is listed here. Nothing is granted by default,
-        and only you can add or remove a site, on this page. Tabs on other sites do not appear in tab lists and are refused. Each site also has tool classes (read, interact, sensitive): a tool in a class you did not allow is refused on that site.
+        and only you can add or remove a site, on this page. Granting a site also asks the browser for access to just that site (you approve its prompt); revoking it takes that access back. Tabs on other sites do not appear in tab lists and are refused. Each site also has tool classes (read, interact, sensitive): a tool in a class you did not allow is refused on that site.
       </p>
+      <p id="migration-note" class="status" role="status" hidden></p>
       <div id="sites-list"></div>
       <form id="site-form" novalidate>
         <p>
@@ -66,7 +67,7 @@
           <legend>Tools allowed on this site</legend>
           <label><input type="checkbox" id="site-class-read" checked> read: see the page (passwords, payment and one-time-code fields stay blank), find, wait, watch, list its WebMCP tools</label><br>
           <label><input type="checkbox" id="site-class-interact"> interact: open, navigate, click, type, fill, scroll, call the page's WebMCP tools</label><br>
-          <label><input type="checkbox" id="site-class-sensitive"> sensitive: screenshots and GIFs, console and network monitoring, cookies, cors_fetch, evaluate, pod injection</label>
+          <label><input type="checkbox" id="site-class-sensitive"> sensitive: screenshots and GIFs, console and network monitoring, cookies, cors_fetch, evaluate</label>
         </fieldset>
         <p id="site-error" class="status" role="alert"></p>
         <div class="row"><button type="submit" id="btn-site">Grant</button></div>

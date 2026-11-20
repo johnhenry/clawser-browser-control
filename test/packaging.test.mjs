@@ -53,8 +53,8 @@ describe('manifests', () => {
 
 describe('permission justifications', () => {
   const cases = [
-    ['CHROME AND EDGE', () => [...chrome.permissions, ...(chrome.optional_permissions || []), ...chrome.host_permissions]],
-    ['FIREFOX', () => [...firefox.permissions, ...firefox.host_permissions]],
+    ['CHROME AND EDGE', () => [...chrome.permissions, ...(chrome.optional_permissions || []), ...chrome.host_permissions, ...chrome.optional_host_permissions]],
+    ['FIREFOX', () => [...firefox.permissions, ...firefox.host_permissions, ...firefox.optional_host_permissions]],
   ];
   for (const [name, perms] of cases) {
     it(`${name}: every permission has its own heading`, () => {
@@ -66,8 +66,11 @@ describe('permission justifications', () => {
       const known = new Set(perms());
       for (const m of text.matchAll(/^(\S+?)( \(optional\))?\n-+$/gm)) assert.ok(known.has(m[1]), `${name}: stale heading ${m[1]}`);
     });
-    it(`${name}: the blanket host permission is explained as per-site grants and tool classes, not "any page"`, () => {
+    it(`${name}: <all_urls> is explained as optional, requested one site at a time, with per-site grants and tool classes`, () => {
       const text = section(name);
+      assert.match(text, /<all_urls> \(optional\)\n-+\n[^\n]*(one site at a time|per site|each site)/i);
+      assert.match(text, /optional_host_permissions|optional host permission/i);
+      assert.doesNotMatch(text, /A planned follow-up/i);
       assert.match(text, /per-site grant|site grant/i);
       for (const c of ['read', 'interact', 'sensitive']) assert.match(text, new RegExp(`\\b${c}\\b`), `${name} names the ${c} class`);
       assert.match(text, /site_not_granted|refuses?/i);

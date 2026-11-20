@@ -19,21 +19,25 @@ node scripts/package.mjs --zip --out dist    # needs `zip`: dist/clawser-browser
 
 ### What is different about "per-site grants" for a reviewer
 
-The manifests still declare `host_permissions: ["<all_urls>"]`, because Chromium and Firefox only let the page reader run on a site the manifest names. The extension itself refuses every call on a site a person has not granted, by exact origin, in its options page, and allows tools by class (read, interact, sensitive) per site. The justification for `<all_urls>` says exactly this. Reviewers often ask about broad host permissions: the "notes for the reviewer" block in the copy file tells them how to see the gate working (pair, then grant). A follow-up that would remove the question is moving `<all_urls>` to optional host permissions requested per granted site; it is a code change and is not done.
+Since 0.6.0 the manifests declare `<all_urls>` only under `optional_host_permissions`, so the stores show no "all websites" install warning. `host_permissions` lists just the Clawser web app's own origins (`localhost`, `127.0.0.1`, `clawser.erisera.com`). When a person grants a site in the options page, the page calls `permissions.request({ origins: [origin] })` (from the click, as the browsers require) and revoking calls `permissions.remove`. On top of the browser's permission the extension keeps its own gate: a site works only if the person granted it AND the browser holds the permission for it, and tools are allowed by class (read, interact, sensitive) per site. The justification for the optional `<all_urls>` says exactly this. Reviewers may still ask why the optional pattern is declared: the "notes for the reviewer" block tells them how to see the gate working (pair, then grant, then approve the browser prompt).
+
+Users updating from 0.5.0 keep their granted sites but must approve each in the browser again; the options page says so and has an Approve button per site. Mention it in the release notes.
+
+`pod-inject.js` is not in any of the three store packages. `node scripts/package.mjs --with-pod-inject` builds a variant that has it; do not submit that one.
 
 ## 1. Chrome Web Store (the listing already exists)
 
 Extension id `dljchbfodafekojicopaboiegophjcbc`. Dashboard: <https://chrome.google.com/webstore/devconsole>.
 
 1. Open the item, then **Store listing**. Replace the **Detailed description** with "Detailed description (Chrome Web Store, Edge Add-ons)" from the copy file. Check **Category** and **Language**.
-2. **Graphic assets**: icon `store/icon-128.png`, screenshots `store/screenshot-1280x800.png` and `-640x400.png`, small tile `promo-tile-440x280.png`, marquee `promo-marquee-1400x560.png`. The current screenshots show the old blanket model and a broken logo: **replace them** (see "Screenshots" below) before submitting 0.5.0.
+2. **Graphic assets**: icon `store/icon-128.png`, screenshots `store/screenshot-1280x800.png` and `-640x400.png`, small tile `promo-tile-440x280.png`, marquee `promo-marquee-1400x560.png`. The current screenshots show the old blanket model and a broken logo: **replace them** (see "Screenshots" below) before submitting 0.6.0.
 3. **Privacy** tab:
    - **Single purpose**: paste "Single purpose description" (CHROME AND EDGE section).
-   - **Permission justification**: one box per permission (`tabs`, `activeTab`, `scripting`, `userScripts`, `webRequest`, `cookies`, `storage`, `alarms`, `offscreen`, `sidePanel`, `contextMenus`, and the optional `debugger`), and **Host permission justification** for `<all_urls>`: paste each block from the copy file. Delete a box for a permission the manifest no longer has.
+   - **Permission justification**: one box per permission (`tabs`, `activeTab`, `scripting`, `userScripts`, `webRequest`, `cookies`, `storage`, `alarms`, `offscreen`, `sidePanel`, `contextMenus`, and the optional `debugger`), and **Host permission justification** for the five built-in Clawser origins and the optional `<all_urls>`: paste each block from the copy file. Delete a box for a permission the manifest no longer has.
    - **Remote code**: **No, I am not using remote code** (every script is packaged).
    - **Data usage**: tick none of the data types (nothing is sent to a server) and certify the three statements.
    - **Privacy policy URL**: `https://github.com/johnhenry/clawser-browser-control/blob/main/store/privacy-policy.md`.
-4. Save the draft. Then push the tag (`git tag v0.5.0 && git push origin v0.5.0`): the workflow uploads and submits the package. Review typically takes days; a broad permission can add a "in-depth review" notice.
+4. Save the draft. Then push the tag (`git tag v0.6.0 && git push origin v0.6.0`): the workflow uploads and submits the package. Review typically takes days; an optional host permission does not add the in-depth review notice a required `<all_urls>` can.
 5. Optional: if the listing was created before `CWS_PUBLISHER_ID` (repository variable) and `CWS_CLIENT_ID`, `CWS_CLIENT_SECRET`, `CWS_REFRESH_TOKEN` (repository secrets) were set, they must still be valid; the upload step fails loudly if not.
 
 ## 2. Microsoft Edge Add-ons
@@ -55,8 +59,8 @@ Dashboard: <https://addons.mozilla.org/developers/>. The package is `clawser-bro
 
 1. **Account.** Create or sign in to a Firefox Account, then **Submit a New Add-on**.
 2. **Distribution.** **On this site** (listed). Accept the Distribution Agreement.
-3. **Upload** `dist/clawser-browser-control-firefox.zip`. The validator should pass. Warnings about `<all_urls>` or `userScripts` are expected; the reviewer notes explain them. The manifest already declares `data_collection_permissions: required: ["none"]` (what AMO now asks every new add-on).
-4. **Source code.** `pod-inject.js` is a generated bundle, so AMO asks for the source: answer **Yes**, and upload a source zip made with `git archive --format=zip -o dist/source.zip HEAD`. In the "build" notes say: `npm ci && npm run build:pod-inject` regenerates `pod-inject.js`; everything else is unminified source; `node scripts/package.mjs firefox` stages the package (manifest from `firefox/manifest.json`).
+3. **Upload** `dist/clawser-browser-control-firefox.zip`. The validator should pass. A warning about `userScripts` is expected, and one about the optional `<all_urls>` may appear; the reviewer notes explain them. The manifest already declares `data_collection_permissions: required: ["none"]` (what AMO now asks every new add-on).
+4. **Source code.** The package has no generated or minified file (`pod-inject.js`, the one generated bundle, is not in the default build), so AMO should not ask for source. If it does, answer **Yes** and upload `git archive --format=zip -o dist/source.zip HEAD`; in the "build" notes say that everything shipped is unminified source and `node scripts/package.mjs firefox` stages the package (manifest from `firefox/manifest.json`).
 5. **Listing.** Name, **Summary** (the FIREFOX SUMMARY line, 250 characters at most), **Description** (the Firefox description), category (Other), support site and email, **License** MIT, **Privacy policy** (paste the policy text or link it), screenshots.
 6. **Notes to reviewer.** Paste "Notes for the reviewer". Say that there is no side panel and that the options page is the add-on's Preferences in `about:addons`.
 7. **Submit.** Listed add-ons are reviewed by a person; expect some days. After approval Mozilla signs it; users install from the listing.
