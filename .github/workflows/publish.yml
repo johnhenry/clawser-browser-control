@@ -45,25 +45,42 @@ jobs:
           refresh-token: ${{ secrets.CWS_REFRESH_TOKEN }}
           publish: true
 
-      - name: Build Firefox extension zip
-        # Same file list as the Chrome zip, but with firefox/manifest.json
-        # swapped in at the zip root (extension manifests must be at the
-        # archive root). No AMO auto-publish step yet — that needs Mozilla
-        # Add-ons API credentials (JWT issuer/secret) this repo doesn't have
-        # configured. This just attaches an installable, signed-by-nobody
-        # zip to the GitHub Release; manual AMO submission still required
-        # until those credentials exist. See #14 item 4.
+      - name: Build the Edge and Firefox zips
+        # scripts/package.mjs stages each build from scripts/dist-files.txt with
+        # its own manifest at the zip root (Edge ships the Chrome manifest, so
+        # its zip differs only in name; Firefox swaps in firefox/manifest.json).
+        # Neither store is auto-published from here unless its credentials are
+        # configured (see the Edge step below and docs/STORES.md for the AMO step).
+        run: node scripts/package.mjs --zip --out dist edge firefox
+
+      - name: Upload to Microsoft Edge Add-ons
+        # Skipped until a person creates the Edge listing and sets repository
+        # variable EDGE_PRODUCT_ID plus secrets EDGE_CLIENT_ID and EDGE_API_KEY
+        # (docs/STORES.md). Uses the Add-ons Publish API v1.1. NOT yet exercised
+        # against the live API: the first tagged release after setup is its test.
+        if: ${{ vars.EDGE_PRODUCT_ID != '' }}
+        env:
+          EDGE_PRODUCT_ID: ${{ vars.EDGE_PRODUCT_ID }}
+          EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
+          EDGE_API_KEY: ${{ secrets.EDGE_API_KEY }}
         run: |
-          mkdir -p dist/firefox-stage
-          grep -v '^manifest\.json$' scripts/dist-files.txt > /tmp/firefox-dist-files.txt
-          cp -r $(cat /tmp/firefox-dist-files.txt) dist/firefox-stage/
-          cp firefox/manifest.json dist/firefox-stage/manifest.json
-          (cd dist/firefox-stage && zip -r ../clawser-browser-control-firefox.zip . -x "*.DS_Store")
+          base="https://api.addons.edge.microsoft.com/v1/products/$EDGE_PRODUCT_ID/submissions"
+          hdr=(-H "Authorization: ApiKey $EDGE_API_KEY" -H "X-ClientID: $EDGE_CLIENT_ID")
+          loc=$(curl -fsS -D - -o /dev/null -X POST "${hdr[@]}" -H "Content-Type: application/zip" \
+            --data-binary @dist/clawser-browser-control-edge.zip "$base/draft/package" | tr -d '\r' | awk -F': ' 'tolower($1)=="location"{print $2}')
+          test -n "$loc"
+          for i in $(seq 1 30); do
+            st=$(curl -fsS "${hdr[@]}" "$base/draft/package/operations/$loc" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).status")
+            echo "package status: $st"; [ "$st" = Succeeded ] && break; [ "$st" = Failed ] && exit 1; sleep 10
+          done
+          test "$st" = Succeeded
+          curl -fsS -X POST "${hdr[@]}" -H "Content-Type: application/json" -d '{"notes":"Release ${{ github.ref_name }}"}' "$base"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/clawser-browser-control.zip
+            dist/clawser-browser-control-edge.zip
             dist/clawser-browser-control-firefox.zip
           generate_release_notes: true

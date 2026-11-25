@@ -252,7 +252,7 @@ function runRequest(msg, sender, sendResponse, auth) {
       const message = err.message || String(err);
       recordAudit({ timestamp: startedAt, action: msg.action, tabId, url: tabUrl, success: false, error: message });
       settle(err && err.cancelled ? { error: CANCELLED_MESSAGE, cancelled: true }
-        : (err && (err.code === 'site_not_granted' || err.code === 'class_not_allowed') ? { error: message, code: err.code } : { error: message }));
+        : (err && ['site_not_granted', 'class_not_allowed', 'site_permission_needed', 'not_in_build', 'capture_not_enabled'].includes(err.code) ? { error: message, code: err.code } : { error: message }));
     });
 }
 
@@ -625,6 +625,7 @@ async function actionScreenshot({ tabId, format, quality }) {
   // Small delay for rendering
   await new Promise((r) => setTimeout(r, 100));
   // The tab may have navigated during the delay: check the site it is on now.
+  await requireCapture();
   const now = await chrome.tabs.get(tid);
   if (!hasClass(now && now.url, await readSites(), 'sensitive')) throw siteRefusal(`The site in tab ${tid}`);
 
@@ -2162,10 +2163,28 @@ async function handleRoutinesSync(msg, sender) {
 }
 
 // Set up the alarm on extension install/update
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   chrome.alarms.create(SCHEDULER_ALARM_NAME, { periodInMinutes: 1 });
-  return setupBrowserTasks({ menus: true });
+  return Promise.all([setupBrowserTasks({ menus: true }), markPermissionMigration(details)]);
 });
+
+/**
+ * 0.6.0 stopped asking the browser for every site (<all_urls>). On an update from an older version, remember which granted sites
+ * now need the person to approve the browser's prompt, so the options page can say so. The extension cannot ask for that itself:
+ * the browser only shows the prompt for a click on one of the extension's own pages.
+ */
+async function markPermissionMigration(details) {
+  try {
+    if (!details || details.reason !== 'update' || !details.previousVersion) return;
+    const [maj, min] = String(details.previousVersion).split('.').map((n) => parseInt(n, 10) || 0);
+    if (maj > 0 || min >= 6) return; // already on the per-site model
+    const grants = await readSites({ all: true });
+    const origins = Object.keys(grants).filter((o) => !grants[o].permitted);
+    await chrome.storage.local.set({ [MIGRATION_KEY]: { from: String(details.previousVersion), at: Date.now(), origins } });
+  } catch (e) {
+    console.warn('[clawser-ext] Could not record the permission migration:', e);
+  }
+}
 
 // Also ensure alarm exists on startup
 chrome.runtime.onStartup?.addListener(() => {
@@ -2760,6 +2779,7 @@ async function actionGifRecordStart({ tabId, fps = 2, maxDurationSec = 15, forma
   if (gifRecordingState) throw new Error('A GIF recording is already in progress');
   if (!(maxDurationSec > 0 && maxDurationSec <= 60)) throw new Error('maxDurationSec must be between 1 and 60');
 
+  await requireCapture();
   const tid = await resolveTabId({ tabId });
   const tab = await chrome.tabs.get(tid);
   await chrome.tabs.update(tid, { active: true });
@@ -2798,6 +2818,11 @@ async function actionGifRecordStart({ tabId, fps = 2, maxDurationSec = 15, forma
         return;
       }
       if (!tab.active) return;
+      if (!(await captureEnabled())) { // the person turned the all-sites access off: end the recording and drop its frames
+        clearInterval(rec.timerId);
+        if (gifRecordingState === rec) gifRecordingState = null;
+        return;
+      }
       const dataUrl = await chrome.tabs.captureVisibleTab(rec.windowId, {
         format: rec.format,
         quality: rec.quality,
@@ -2878,7 +2903,11 @@ async function ensureOffscreenDocument() {
   });
 }
 
-// ── Pod Injection ───────────────────────────────────────────────
+// ── Pod Injection (opt-in build only) ───────────────────────────
+//
+// The default build ships no pod-inject.js and lists no inject_pod capability (CLW-XT-05). A build made with
+// `node scripts/package.mjs --with-pod-inject` adds the file and a web_accessible_resources entry for it; that
+// entry is how the running extension knows the build has it.
 
 /**
  * Inject a lightweight Pod into a target tab's MAIN world.
@@ -2886,6 +2915,11 @@ async function ensureOffscreenDocument() {
  * discovery and a visual overlay indicator.
  */
 async function actionInjectPod({ tabId }) {
+  if (!POD_INJECT_BUILT) {
+    const e = new Error('Pod injection is not part of this build of the extension. It exists only in a build made with --with-pod-inject.');
+    e.code = 'not_in_build';
+    throw e;
+  }
   if (!tabId) throw new Error('inject_pod requires tabId');
   await chrome.scripting.executeScript({
     target: { tabId },
@@ -3134,12 +3168,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // origin (taken from the browser) and the token on every request, notify and cancel.
 // Risky capabilities are per origin and off by default; a person turns them on in the options page.
 
+/** True only in the opt-in build that ships pod-inject.js (it declares the file in web_accessible_resources). */
+var POD_INJECT_BUILT = (() => {
+  try {
+    const war = chrome.runtime.getManifest().web_accessible_resources;
+    return Array.isArray(war) && war.some((r) => r && Array.isArray(r.resources) && r.resources.includes('pod-inject.js'));
+  } catch { return false; }
+})();
 const PAIRED_KEY = 'pairedOrigins';
 const PENDING_KEY = 'pairingPending'; // chrome.storage.session
 const PENDING_MAX = 10;
 /** Actions gated behind a per-origin capability, and the capability each needs. */
-const ACTION_CAPABILITY = { evaluate: 'evaluate', cookies: 'cookies', cors_fetch: 'cors_fetch', inject_pod: 'inject_pod' };
-const CAPABILITY_NAMES = ['evaluate', 'cookies', 'cors_fetch', 'inject_pod'];
+const ACTION_CAPABILITY = { evaluate: 'evaluate', cookies: 'cookies', cors_fetch: 'cors_fetch', ...(POD_INJECT_BUILT ? { inject_pod: 'inject_pod' } : {}) };
+const CAPABILITY_NAMES = ['evaluate', 'cookies', 'cors_fetch', ...(POD_INJECT_BUILT ? ['inject_pod'] : [])];
 const NOT_PAIRED_MESSAGE = 'This page is not paired with the Clawser Browser Control extension. Open the extension\'s options page and pair this origin.';
 
 function defaultCaps() { return Object.fromEntries(CAPABILITY_NAMES.map((c) => [c, false])); }
@@ -3376,6 +3417,7 @@ async function pairingOverview() {
 // other tab-targeting action is refused with code 'site_not_granted' before it runs.
 
 const SITES_KEY = 'siteGrants';
+const MIGRATION_KEY = 'permissionMigration';
 
 // ---- Per-site tool classes (D21, wave X-2) ----
 //
@@ -3425,7 +3467,32 @@ function runSitesJob(fn) {
   return run;
 }
 
-async function readSites() {
+/**
+ * The browser's host permission pattern for an exact origin. Match patterns carry no port (Firefox rejects one, Chromium ignores it), so
+ * the permission is for the host on any port; the extension's own grant stays the exact origin, scheme and port.
+ */
+function hostPatternOf(origin) {
+  const u = new URL(origin);
+  return `${u.protocol}//${u.hostname}/*`;
+}
+
+/** Does the browser itself let the extension reach `origin`? (A grant is the person's choice; this is the browser's permission that must match it.) Fails closed. */
+async function hasHostPermission(origin) {
+  try {
+    const p = chrome.permissions;
+    if (!p || typeof p.contains !== 'function') return false;
+    return (await p.contains({ origins: [hostPatternOf(origin)] })) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The granted sites. By default only the EFFECTIVE grants: a grant counts only while the browser's own host permission for
+ * that origin is also held (so a revoke in the browser's extension settings, or an update from 0.5.0, which asked for
+ * every site, closes the site). `{ all: true }` also returns the grants that lack the permission, marked `permitted: false`.
+ */
+async function readSites({ all = false } = {}) {
   try {
     const stored = await chrome.storage.local.get(SITES_KEY);
     const raw = stored && stored[SITES_KEY];
@@ -3433,7 +3500,10 @@ async function readSites() {
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
       for (const [origin, rec] of Object.entries(raw)) {
         const checked = normalizeSiteOrigin(origin);
-        if (checked.ok && checked.origin === origin) out[origin] = { grantedAt: Number(rec && rec.grantedAt) || 0, classes: cleanClasses(rec && rec.classes) };
+        if (!(checked.ok && checked.origin === origin)) continue;
+        const permitted = await hasHostPermission(origin);
+        if (!permitted && !all) continue;
+        out[origin] = { grantedAt: Number(rec && rec.grantedAt) || 0, classes: cleanClasses(rec && rec.classes), permitted };
       }
     }
     return out;
@@ -3474,6 +3544,35 @@ function hasClass(url, grants, cls) {
   return !!origin && grants[origin].classes.includes(cls);
 }
 
+function permissionRefusal(origin) {
+  const e = new Error(`${origin} is granted, but the browser has not given the extension access to it. A person can approve it in the extension's options page.`);
+  e.code = 'site_permission_needed';
+  return e;
+}
+
+// ---- Pixels need the browser's all-sites access (wave R-3) ----
+//
+// chrome.tabs.captureVisibleTab works only when the extension holds <all_urls> (or activeTab, which a person's click grants for one
+// tab at a time and so cannot serve an agent-driven call). So screenshots and GIF frames are a separate, off-by-default switch in the
+// options page that asks the browser for <all_urls>. Every other tool works on the per-site permission alone. With the switch on the
+// extension's own gates (the granted-site list and the tool classes) still decide which sites are captured.
+async function captureEnabled() {
+  try {
+    const p = chrome.permissions;
+    if (!p || typeof p.contains !== 'function') return false;
+    return (await p.contains({ origins: ['<all_urls>'] })) === true;
+  } catch {
+    return false;
+  }
+}
+
+async function requireCapture() {
+  if (await captureEnabled()) return;
+  const e = new Error("Screenshots and GIFs need the browser's all-sites access, which is off. A person can turn it on in the extension's options page.");
+  e.code = 'capture_not_enabled';
+  throw e;
+}
+
 function siteRefusal(what) {
   const e = new Error(`${what} is not a granted site. A person can grant it in the extension's options page.`);
   e.code = 'site_not_granted';
@@ -3487,12 +3586,14 @@ function siteRefusal(what) {
  */
 async function siteGate(action, params) {
   if (NO_SITE_ACTIONS.has(action)) return params;
-  const grants = await readSites();
+  const grants = await readSites({ all: true });
   const cls = classOf(action);
   // The site AND the class: a granted site that does not allow this class refuses it (class_not_allowed).
+  // And the browser's own permission for the site: a grant without it (an update from 0.5.0, or access taken away in the browser) is refused too.
   const allowed = (url, label) => {
     const origin = siteOf(url, grants);
     if (!origin) throw siteRefusal(label);
+    if (!grants[origin].permitted) throw permissionRefusal(origin);
     if (!grants[origin].classes.includes(cls)) throw classRefusal(origin, cls);
   };
   // A destination that is not an http(s) URL is left to the action's own validation, which refuses it.
@@ -3527,13 +3628,21 @@ async function actionSiteGrants() {
 }
 
 async function sitesOverview() {
-  const grants = await readSites();
-  return { classes: SITE_CLASSES, sites: Object.entries(grants).map(([origin, rec]) => ({ origin, grantedAt: rec.grantedAt, classes: [...rec.classes] })).sort((a, b) => a.origin.localeCompare(b.origin)) };
+  const grants = await readSites({ all: true });
+  const sites = Object.entries(grants).map(([origin, rec]) => ({ origin, grantedAt: rec.grantedAt, classes: [...rec.classes], permitted: rec.permitted })).sort((a, b) => a.origin.localeCompare(b.origin));
+  const stored = await chrome.storage.local.get(MIGRATION_KEY).catch(() => ({}));
+  const m = stored && stored[MIGRATION_KEY];
+  const migration = m && typeof m === 'object' ? { from: String(m.from || ''), at: Number(m.at) || 0, needing: sites.filter((x) => !x.permitted && Array.isArray(m.origins) && m.origins.includes(x.origin)).map((x) => x.origin) } : null;
+  return { classes: SITE_CLASSES, sites, capture: await captureEnabled(), migration: migration && migration.needing.length ? migration : null };
 }
 
 async function addSite(input, classes) {
   const checked = normalizeSiteOrigin(input);
   if (!checked.ok) return checked;
+  // The options page asks the browser first (that needs the person's click); a grant is recorded only once the browser holds the permission.
+  if (!(await hasHostPermission(checked.origin))) {
+    return { ok: false, code: 'permission_missing', error: `The browser has not given the extension access to ${checked.origin}. Approve the browser's prompt when you grant a site.` };
+  }
   await runSitesJob(async () => {
     const stored = await chrome.storage.local.get(SITES_KEY);
     const map = (stored && stored[SITES_KEY] && typeof stored[SITES_KEY] === 'object') ? { ...stored[SITES_KEY] } : {};
@@ -3566,7 +3675,19 @@ async function removeSite(origin) {
     delete map[origin];
     await chrome.storage.local.set({ [SITES_KEY]: map });
   });
-  return { ok: true };
+  // Take the browser's permission back too, so what the browser allows matches what the person allows. (A built-in Clawser origin is a
+  // required permission and cannot be removed; that is not an error.)
+  // Another granted origin on the same host (a different port) still needs the host's permission, so it is kept then.
+  let permissionRemoved = false;
+  try {
+    const checked = normalizeSiteOrigin(origin);
+    if (checked.ok && chrome.permissions && typeof chrome.permissions.remove === 'function') {
+      const pattern = hostPatternOf(checked.origin);
+      const stillNeeded = Object.keys(await readSites({ all: true })).some((o) => hostPatternOf(o) === pattern);
+      if (!stillNeeded) permissionRemoved = (await chrome.permissions.remove({ origins: [pattern] })) === true;
+    }
+  } catch { /* required or already gone */ }
+  return { ok: true, permissionRemoved };
 }
 
 // ---- UI message router ----

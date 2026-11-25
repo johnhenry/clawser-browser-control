@@ -121,6 +121,9 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   if (opts.grants !== false && !('siteGrants' in localStore)) {
     localStore.siteGrants = Object.fromEntries(TEST_SITES.map((o) => [o, { grantedAt: 1, classes: ['read', 'interact', 'sensitive'] }]));
   }
+  // The browser's own host permissions (wave R-3): by default every origin is held, so the older suites stay about what they test. Pass
+  // { hostPermissions: false } for none, or an array of origins ("https://a.test") to hold only those. The set is returned as `hostPerms`.
+  const hostPerms = { all: opts.hostPermissions === undefined, set: new Set((Array.isArray(opts.hostPermissions) ? opts.hostPermissions : []).map((o) => (o === '<all_urls>' ? o : `${new URL(o).protocol}//${new URL(o).hostname}/*`))), removed: [], requested: [] };
   const sessionStore = {}; // chrome.storage.session backing object
   const badge = { text: '', title: '' }; // chrome.action state
   const panelBehavior = []; // chrome.sidePanel.setPanelBehavior() args
@@ -129,7 +132,7 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
     runtime: {
       id: 'ext-id',
       getURL: (p = '') => `chrome-extension://ext-id/${p}`,
-      getManifest: () => ({ version: '9.8.7' }),
+      getManifest: () => ({ version: '9.8.7', ...(opts.podInject ? { web_accessible_resources: [{ resources: ['pod-inject.js'], matches: ['https://clawser.erisera.com/*'] }] } : {}) }),
       onMessage: { addListener: (fn) => { hooks.listener = fn; } },
       onInstalled: { addListener: (fn) => { hooks.installedListener = fn; } },
       onStartup: { addListener: (fn) => { hooks.startupListener = fn; } },
@@ -153,6 +156,11 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
       goBack: async () => {},
       goForward: async () => {},
       sendMessage: async () => {},
+    },
+    permissions: {
+      contains: async ({ origins = [] } = {}) => origins.every((o) => hostPerms.all || hostPerms.set.has('<all_urls>') || hostPerms.set.has(o)),
+      request: async ({ origins = [] } = {}) => { hostPerms.requested.push(...origins); for (const o of origins) hostPerms.set.add(o); return true; },
+      remove: async ({ origins = [] } = {}) => { hostPerms.removed.push(...origins); hostPerms.all = false; for (const o of origins) hostPerms.set.delete(o); return true; },
     },
     windows: { update: async () => ({ id: 1, width: 100, height: 100 }) },
     scripting: {
@@ -301,6 +309,8 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
 
   /** Fire runtime.onInstalled. */
   function install() { return hooks.installedListener?.({ reason: 'install' }); }
+  /** Fire runtime.onInstalled as an update from `previousVersion`. */
+  function update(previousVersion) { return hooks.installedListener?.({ reason: 'update', previousVersion }); }
 
   /** Simulate chrome.tabs.onUpdated. */
   function tabUpdated(tabId, changeInfo, tab = { id: tabId }) { for (const fn of [...hooks.tabUpdatedListeners]) fn(tabId, changeInfo, tab); }
@@ -308,5 +318,5 @@ export function loadBackground(chromeOverrides = {}, opts = {}) {
   /** Simulate a context-menu click. */
   function clickMenu(info, tab) { return hooks.menuListener?.(info, tab); }
 
-  return { sandbox, send, sendRaw, ensurePaired, sendUi, install, clickMenu, tabUpdated, notify, fireAlarm, chrome: chromeStub, idbStore, pageIdb, pageSync, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
+  return { sandbox, send, sendRaw, ensurePaired, sendUi, install, update, hostPerms, clickMenu, tabUpdated, notify, fireAlarm, chrome: chromeStub, idbStore, pageIdb, pageSync, menusCreated, registered, localStore, sessionStore, badge, panelBehavior, hooks };
 }
