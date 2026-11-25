@@ -1,6 +1,6 @@
 # Clawser Browser Control — Privacy Policy
 
-**Last updated:** October 8, 2026
+**Last updated:** November 25, 2026 (version 0.6.0)
 
 ## Overview
 
@@ -23,7 +23,7 @@ The extension requires browser permissions to provide its functionality. When ac
 
 - **Tab information** (URLs, titles) — to navigate and manage tabs on your behalf
 - **Page content (DOM)** — to read and interact with web page elements
-- **Screenshots** — to capture visible page content for the agent
+- **Screenshots and GIF recordings** — to capture visible page content for the agent, only after you turn on the separate "Screenshots and GIFs" switch in the options page (off by default; turning it on asks the browser for access to all sites, because the browser's capture API needs it)
 - **Cookies** — to relay authentication state to the agent when requested
 - **Network requests** — to monitor page network activity when requested
 - **Browser-task drafts** — when you use the side panel or a right-click entry, the page title, URL, and (for a section) a selector and a short text hint of at most 120 characters are sent to your own Clawser tab as a draft. Nothing runs until you confirm it in Clawser
@@ -57,7 +57,8 @@ The extension can only work on a site you have granted, by exact origin, in its 
 | `sidePanel` | Show the browser-tasks panel (Chrome and Edge) |
 | `contextMenus` | Add right-click entries that start a browser-task draft |
 | `debugger` (optional) | Not used in this version |
-| `<all_urls>` (host) | Lets the reader run on a site once you grant it; refused everywhere else |
+| Host permissions | Only the pairing origins (localhost, 127.0.0.1, `https://clawser.erisera.com`) are declared up front |
+| `<all_urls>` (optional host) | Not granted at install. When you grant a site in the options page, the browser asks you for that one origin, and revoking the site gives it back. Only the "Screenshots and GIFs" switch asks for all sites, with its own prompt |
 
 ## Changes
 
